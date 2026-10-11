@@ -7,7 +7,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use ipnet::IpNet;
 use serde::Deserialize;
+
+use crate::access::{AccessConfig, AuthConfig, Limits};
 
 /// How a published port is handled (see docs/REQUIREMENTS.md §5.2a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -136,6 +139,8 @@ pub struct PortSpec {
     pub listen: Option<u16>,
     /// Close raw (non-HTTP) connections after this long without traffic.
     pub idle_timeout: Option<Duration>,
+    /// Allow/deny lists, connection cap and login for this port.
+    pub access: AccessConfig,
 }
 
 impl PortSpec {
@@ -180,6 +185,7 @@ impl PortSpec {
             public,
             listen,
             idle_timeout,
+            access: AccessConfig::default(),
         };
         if mode != Mode::Udp && spec.listen.is_none() {
             spec.listen = Some(spec.default_listen_port()?);
@@ -237,6 +243,8 @@ pub struct FileConfig {
     pub network: NetworkSection,
     #[serde(default)]
     pub acme: AcmeSection,
+    #[serde(default)]
+    pub limits: Limits,
     #[serde(default, rename = "port")]
     pub ports: Vec<PortEntry>,
 }
@@ -249,6 +257,9 @@ pub struct ServerSection {
     /// Local port for the plain-HTTP listener the router maps public port 80 to
     /// (ACME HTTP-01 and redirects). Default 80; 0 disables it.
     pub http_listen: Option<u16>,
+    /// Log every HTTP request at info level (otherwise debug).
+    #[serde(default)]
+    pub access_log: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -299,6 +310,16 @@ pub struct PortEntry {
     pub listen: Option<u16>,
     pub mode: Option<Mode>,
     pub idle_timeout: Option<String>,
+    /// Only these networks may connect (CIDR, e.g. `203.0.113.0/24`).
+    #[serde(default)]
+    pub allow: Vec<IpNet>,
+    /// These networks may never connect.
+    #[serde(default)]
+    pub deny: Vec<IpNet>,
+    /// Maximum simultaneous connections to this port (e.g. viewers).
+    pub max_connections: Option<usize>,
+    /// Require a login (HTTP ports only).
+    pub auth: Option<AuthConfig>,
 }
 
 /// A port written either as a TOML integer (`3000`) or string (`"50000-60000"`).
@@ -326,13 +347,20 @@ impl PortEntry {
             .map(parse_duration)
             .transpose()?;
         let public = self.public.as_ref().map(PortValue::to_range).transpose()?;
-        PortSpec::new(
+        let mut spec = PortSpec::new(
             self.mode.unwrap_or(Mode::Auto),
             self.local.to_range()?,
             public,
             self.listen,
             idle,
-        )
+        )?;
+        spec.access = AccessConfig {
+            allow: self.allow.clone(),
+            deny: self.deny.clone(),
+            max_connections: self.max_connections,
+            auth: self.auth.clone(),
+        };
+        Ok(spec)
     }
 }
 
@@ -378,6 +406,15 @@ pub fn validate_specs(specs: &[PortSpec]) -> Result<()> {
             && listen == a.local.start
         {
             bail!("listen port {listen} is the app's own port; choose a different `listen`");
+        }
+        if a.access.auth.is_some() && !matches!(a.mode, Mode::Auto | Mode::Https) {
+            bail!("port {}: `auth` needs mode auto or https", a.public);
+        }
+        if a.mode == Mode::Udp && a.access != AccessConfig::default() {
+            bail!(
+                "port {}: allow/deny/max_connections/auth do not apply to udp (traffic goes straight to the app)",
+                a.public
+            );
         }
     }
     Ok(())
@@ -455,9 +492,15 @@ mod tests {
             local = 3000
             idle_timeout = "30m"
 
+            [limits]
+            max_connections_per_ip = 50
+
             [[port]]
             local = 7880
             public = 7443
+            allow = ["203.0.113.0/24"]
+            max_connections = 120
+            auth = { user = "me", password = "pw" }
 
             [[port]]
             local = "50000-50100"
@@ -469,6 +512,9 @@ mod tests {
         assert_eq!(specs.len(), 3);
         assert_eq!(specs[0].idle_timeout, Some(Duration::from_secs(1800)));
         assert_eq!(specs[1].listen, Some(7443));
+        assert_eq!(specs[1].access.max_connections, Some(120));
+        assert_eq!(specs[1].access.auth.as_ref().unwrap().user, "me");
+        assert_eq!(cfg.limits.max_connections_per_ip, 50);
         assert_eq!(specs[2].local.count(), 101);
         validate_specs(&specs).unwrap();
     }

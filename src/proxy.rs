@@ -1,10 +1,11 @@
 //! HTTP reverse proxy: streams bodies, passes WebSocket/other upgrades through,
 //! sets forwarded headers and rewrites localhost redirects (F2, F8, F11, F20–F22, F33).
 
+use std::any::Any;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -15,9 +16,13 @@ use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use tracing::debug;
+use tracing::{debug, info, warn};
+
+use crate::access::{AuthOutcome, BasicAuth, Guard};
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
+/// Connection permits kept alive for as long as the connection (or its upgrade) lives.
+pub type Hold = Arc<dyn Any + Send + Sync>;
 
 /// Headers that describe a single hop and must not be forwarded.
 const HOP_BY_HOP: &[&str] = &[
@@ -42,15 +47,30 @@ const FORWARDED_HEADERS: &[&str] = &[
     "x-real-ip",
 ];
 
+/// Why a request was refused before reaching the app.
+enum Denied {
+    Blocked,
+    LoginRequired,
+}
+
 pub struct HttpProxy {
     client: Client<HttpConnector, Incoming>,
     upstream: SocketAddr,
     /// Used for redirects when the client sent no Host header.
     fallback_authority: String,
+    auth: Option<Arc<BasicAuth>>,
+    guard: Arc<Guard>,
+    access_log: bool,
 }
 
 impl HttpProxy {
-    pub fn new(upstream: SocketAddr, fallback_authority: String) -> Arc<Self> {
+    pub fn new(
+        upstream: SocketAddr,
+        fallback_authority: String,
+        auth: Option<Arc<BasicAuth>>,
+        guard: Arc<Guard>,
+        access_log: bool,
+    ) -> Arc<Self> {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         connector.set_connect_timeout(Some(Duration::from_secs(5)));
@@ -61,6 +81,9 @@ impl HttpProxy {
             client,
             upstream,
             fallback_authority,
+            auth,
+            guard,
+            access_log,
         })
     }
 
@@ -68,6 +91,81 @@ impl HttpProxy {
         self: Arc<Self>,
         mut req: Request<Incoming>,
         peer: SocketAddr,
+        hold: Hold,
+    ) -> Result<Response<ProxyBody>, Infallible> {
+        let started = Instant::now();
+        let ip = peer.ip().to_canonical();
+        let method = req.method().clone();
+        // Path only: query strings often carry tokens.
+        let path = req.uri().path().to_owned();
+
+        let mut resp = match self.authorize(&mut req, ip) {
+            Ok(session_cookie) => {
+                let Ok(mut resp) = self.clone().forward(req, peer, hold).await;
+                if let Some(cookie) = session_cookie {
+                    resp.headers_mut().append(header::SET_COOKIE, cookie);
+                }
+                resp
+            }
+            Err(Denied::Blocked) => error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed logins; try again later",
+            ),
+            Err(Denied::LoginRequired) => unauthorized(),
+        };
+        if self.auth.is_some() {
+            // Responses behind a login must not be cached by shared caches.
+            resp.headers_mut()
+                .entry(header::CACHE_CONTROL)
+                .or_insert(HeaderValue::from_static("private"));
+        }
+
+        let (status, ms) = (resp.status().as_u16(), started.elapsed().as_millis());
+        if self.access_log {
+            info!(target: "hostip::access", "{ip} {method} {path} {status} {ms}ms");
+        } else {
+            debug!(target: "hostip::access", "{ip} {method} {path} {status} {ms}ms");
+        }
+        Ok(resp)
+    }
+
+    /// Enforces the port's login, if any. `Ok` may carry a session cookie to set.
+    fn authorize(
+        &self,
+        req: &mut Request<Incoming>,
+        ip: IpAddr,
+    ) -> Result<Option<HeaderValue>, Denied> {
+        let Some(auth) = &self.auth else {
+            return Ok(None);
+        };
+        if self.guard.is_blocked(ip) {
+            return Err(Denied::Blocked);
+        }
+        match auth.check(req.headers()) {
+            AuthOutcome::Allowed(cookie) => {
+                if cookie.is_some() {
+                    self.guard.record_auth_success(ip);
+                }
+                auth.strip(req.headers_mut());
+                Ok(cookie)
+            }
+            AuthOutcome::Missing => Err(Denied::LoginRequired),
+            AuthOutcome::Failed => {
+                if self.guard.record_auth_failure(ip) {
+                    warn!(%ip, "failed login; blocking this address for a while");
+                } else {
+                    warn!(%ip, "failed login");
+                }
+                Err(Denied::LoginRequired)
+            }
+        }
+    }
+
+    async fn forward(
+        self: Arc<Self>,
+        mut req: Request<Incoming>,
+        peer: SocketAddr,
+        hold: Hold,
     ) -> Result<Response<ProxyBody>, Infallible> {
         let authority = request_authority(&req).unwrap_or_else(|| self.fallback_authority.clone());
 
@@ -120,6 +218,7 @@ impl HttpProxy {
             };
             let upstream_upgrade = hyper::upgrade::on(&mut resp);
             tokio::spawn(async move {
+                let _hold = hold;
                 match tokio::try_join!(client_upgrade, upstream_upgrade) {
                     Ok((client, upstream)) => {
                         let (mut client, mut upstream) =
@@ -233,6 +332,15 @@ pub fn rewrite_location(location: &str, local_port: u16, public_authority: &str)
     }
     let path = uri.path_and_query().map_or("/", |p| p.as_str());
     Some(format!("https://{public_authority}{path}"))
+}
+
+fn unauthorized() -> Response<ProxyBody> {
+    let mut resp = error_response(StatusCode::UNAUTHORIZED, "login required");
+    resp.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"hostip\", charset=\"UTF-8\""),
+    );
+    resp
 }
 
 fn error_response(status: StatusCode, message: &'static str) -> Response<ProxyBody> {

@@ -31,13 +31,20 @@ Milestones **M1** and **M1.5** are done:
   leases are renewed and removed on exit. Falls back to printed manual
   forwarding rules when the router doesn't cooperate, and warns about double NAT
 
-Not done yet: authentication and rate limits, Windows service, relay mode.
+- **Protection**: optional login (HTTP Basic + signed session cookie, Argon2
+  password hashes) with brute-force blocking, IP allow/deny lists, per-port
+  connection caps, per-IP connection and rate limits, access log
+
+Not done yet: Windows service and firewall setup, IP-change hooks for media
+servers, relay mode.
 
 ## Usage
 
 ```
 hostip expose [PORTS]... [--config hostip.toml] [--public-ip IP] [--bind ADDR] [--cert-dir DIR]
               [--no-acme] [--acme-staging] [--acme-email EMAIL] [--http-listen PORT] [--no-upnp]
+              [--auth USER:PASSWORD] [--allow CIDR]... [--max-connections N] [--access-log]
+hostip hash-password   # reads a password on stdin, prints an Argon2 hash for the config
 hostip ip      # show the public and LAN IP addresses
 hostip cert    # show the stored certificate
 ```
@@ -66,6 +73,24 @@ accept the Let's Encrypt Subscriber Agreement. Try `--acme-staging` first while
 setting things up; staging certificates are not trusted by browsers but don't
 count against rate limits. Certificates and the ACME account live in
 `<cert-dir>/acme`.
+
+### Who can connect
+
+By default anyone with the link can open an HTTP port. To require a login:
+
+```
+hostip expose 3000:443 --auth alice:s3cret
+```
+
+Browsers ask once and then get a 12-hour session cookie, so apps that send
+their own `Authorization` header keep working; hostip strips its own
+credentials before forwarding. After 10 wrong passwords from one address it is
+blocked for 15 minutes. A port with a login only accepts HTTP.
+
+Every port also enforces per-IP limits (256 open connections, 1200 new
+connections a minute, generous because many participants can share one
+address) and can be restricted with `allow`/`deny` lists or a
+`max_connections` cap.
 
 ### Router port forwarding
 
@@ -100,9 +125,22 @@ email = "you@example.com"      # optional
 local = 3000
 idle_timeout = "30m"
 
+[server]
+access_log = true
+
+[limits]
+max_connections_per_ip = 256
+new_connections_per_ip_per_minute = 1200
+auth_failures_before_block = 10
+block_minutes = 15
+
 [[port]]
 local = 7880
 public = 7443
+max_connections = 150
+allow = ["0.0.0.0/0"]
+deny = ["198.51.100.0/24"]
+auth = { user = "alice", password_hash = "$argon2id$v=19$..." }
 
 [[port]]
 local = "50000-60000"

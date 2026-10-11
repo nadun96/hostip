@@ -2,6 +2,7 @@
 //!
 //! See `docs/REQUIREMENTS.md` for the requirements and design.
 
+pub mod access;
 pub mod acme;
 pub mod cert;
 pub mod config;

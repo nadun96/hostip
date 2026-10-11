@@ -10,12 +10,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use hostip::access::{self, AuthConfig, Guard};
 use hostip::acme::{self, AcmeManager, AcmeOptions, ChallengeKind, HttpChallenges};
 use hostip::cert::{self, CertStore};
 use hostip::config::{FileConfig, Mode, PortRange, PortSpec, parse_duration, validate_specs};
 use hostip::portmap::{self, DiscoverOptions};
 use hostip::publicip;
-use hostip::server::{self, Server};
+use hostip::server::{self, Server, ServerOptions};
 
 const DEFAULT_IP_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -29,13 +30,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Publish local ports, e.g. `hostip expose 3000 8080 udp:50000-60000`.
-    Expose(ExposeArgs),
+    Expose(Box<ExposeArgs>),
     /// Show this machine's public and LAN IP addresses.
     Ip {
         /// HTTPS endpoints that return the caller's IP as plain text.
         #[arg(long = "source")]
         sources: Vec<String>,
     },
+    /// Hash a password for `password_hash` in the config file (reads it from stdin).
+    HashPassword,
     /// Show the stored certificate.
     Cert {
         #[arg(long)]
@@ -81,6 +84,18 @@ struct ExposeArgs {
     /// Don't open router ports automatically (UPnP / PCP / NAT-PMP).
     #[arg(long)]
     no_upnp: bool,
+    /// Require this login (`user:password`) on every HTTP port without its own `auth`.
+    #[arg(long)]
+    auth: Option<String>,
+    /// Only let these networks connect (CIDR, repeatable), e.g. `--allow 203.0.113.0/24`.
+    #[arg(long = "allow")]
+    allow: Vec<ipnet::IpNet>,
+    /// Maximum simultaneous connections per port.
+    #[arg(long)]
+    max_connections: Option<usize>,
+    /// Log every HTTP request.
+    #[arg(long)]
+    access_log: bool,
 }
 
 #[tokio::main]
@@ -92,7 +107,17 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Expose(args) => expose(args).await,
+        Command::Expose(args) => expose(*args).await,
+        Command::HashPassword => {
+            let mut password = String::new();
+            std::io::stdin().read_line(&mut password)?;
+            let password = password.trim_end_matches(['\r', '\n']);
+            if password.is_empty() {
+                bail!("type the password on stdin, e.g. `echo -n secret | hostip hash-password`");
+            }
+            println!("{}", access::hash_password(password)?);
+            Ok(())
+        }
         Command::Ip { sources } => {
             let sources = if sources.is_empty() {
                 default_sources()
@@ -130,6 +155,20 @@ async fn expose(args: ExposeArgs) -> Result<()> {
     let mut specs = file.port_specs()?;
     for p in &args.ports {
         specs.push(PortSpec::parse_cli(p)?);
+    }
+    let cli_auth = args
+        .auth
+        .as_deref()
+        .map(AuthConfig::parse_cli)
+        .transpose()?;
+    for spec in specs.iter_mut().filter(|s| s.mode != Mode::Udp) {
+        if spec.access.auth.is_none() && matches!(spec.mode, Mode::Auto | Mode::Https) {
+            spec.access.auth = cli_auth.clone();
+        }
+        if spec.access.allow.is_empty() {
+            spec.access.allow = args.allow.clone();
+        }
+        spec.access.max_connections = spec.access.max_connections.or(args.max_connections);
     }
     if specs.is_empty() {
         bail!(
@@ -198,7 +237,11 @@ async fn expose(args: ExposeArgs) -> Result<()> {
     let host = public_ip
         .or(lan_ip)
         .map_or_else(|| "localhost".to_owned(), |ip| ip.to_string());
-    let mut server = Server::bind(&specs, bind, certs.clone(), &host).await?;
+    let options = ServerOptions {
+        guard: Guard::new(file.limits.clone()),
+        access_log: args.access_log || file.server.access_log,
+    };
+    let mut server = Server::bind_with(&specs, bind, certs.clone(), &host, options).await?;
 
     // Plain HTTP on public port 80: ACME HTTP-01 challenges and redirects to https.
     let https_443 = specs
@@ -429,6 +472,18 @@ fn print_summary(
     }
     if let Some(port) = http_listen {
         println!("  TCP 80 -> {pc}:{port}   (Let's Encrypt validation, http->https redirect)");
+    }
+    let open_http: Vec<String> = specs
+        .iter()
+        .filter(|s| matches!(s.mode, Mode::Auto | Mode::Https) && s.access.auth.is_none())
+        .map(|s| s.public.to_string())
+        .collect();
+    if !open_http.is_empty() {
+        println!();
+        println!(
+            "Anyone with the link can open port(s) {}; add `--auth user:password` to require a login.",
+            open_http.join(", ")
+        );
     }
     println!();
     if acme {
