@@ -45,7 +45,7 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 |----|-------------|----------|
 | F1 | Listen for HTTPS on a configurable address/port (default `0.0.0.0:443`, fallback `8443`). | Must |
 | F2 | Reverse-proxy HTTP/1.1 requests to configured local upstreams (`http://127.0.0.1:<port>`). | Must |
-| F3 | Support multiple apps, routed by **port**, **path prefix**, or **hostname** (see §5.2). | Must |
+| F3 | **Stack-agnostic port publishing:** the user gives a list of local ports (TCP and/or UDP); each is published on the same public port number by default, with no knowledge of the app's language, framework or media server (see §5.2a). Path-prefix routing is optional. | Must |
 | F4 | Self-signed fallback: on first run, generate a certificate with the public IP (and LAN IP, `localhost`) as `iPAddress`/`dNSName` SANs; persist key + cert to disk. | Must |
 | F5 | Optional "local CA" mode: generate a root CA once, sign leaf certs with it, and print instructions to install the CA on client devices so browsers stop warning. Useful for testing/private use only — not a solution for public visitors. | Could |
 | F6 | Allow user-supplied cert/key (PEM) instead of generating. | Should |
@@ -71,6 +71,11 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 | F26 | **WebRTC port mapping:** map the media server's UDP port range (and TCP fallback port) on the router via UPnP/NAT-PMP, renew leases, remove on exit; print exact manual port-forward rules when UPnP is unavailable. | Must |
 | F27 | **Public-IP propagation:** on start and on every IP change, expose the current public IP to apps — write it to a file, set it in an env file, and run a configurable `on_ip_change` hook (e.g. restart/reconfigure the SFU so it announces the new IP in ICE candidates). | Must |
 | F28 | **Certificate export:** write the current IP certificate + key as PEM to a configurable path (and run `on_cert_renew` hook) so a TURN-over-TLS server can reuse the same trusted cert. | Should |
+| F30 | Per-port **mode** (§5.2a): `auto` (default), `https`, `tls`, `tcp`, `udp`. | Must |
+| F31 | `auto` mode: terminate TLS, peek the first decrypted bytes; if they are an HTTP request, use the HTTP proxy (forwarded headers, WebSocket/SSE, streaming); otherwise pipe raw bytes to the local port. Plain-HTTP or non-TLS clients on the port get a clear error / redirect to `https://`. | Must |
+| F32 | Upstreams that already speak HTTPS/TLS locally (often with their own self-signed cert) are supported (`upstream_tls = true`); verification may be skipped only for loopback upstreams. | Should |
+| F33 | In `https` mode, rewrite `Location`/`Content-Location` redirect headers that point at `http://localhost:<port>` / `127.0.0.1` to the public `https://<ip>:<port>`. Bodies are never rewritten. | Should |
+| F34 | One-line CLI: `hostip expose 3000 8080 7880 udp:3478 udp:50000-60000` publishes ports with defaults, and `hostip expose --config hostip.toml` for full control. | Must |
 | F29 | Self-test for conferencing: verify from outside that 443/TCP and the UDP media range are reachable (via a lightweight STUN/echo check). | Should |
 
 ## 3. Security requirements
@@ -147,6 +152,34 @@ production scale.
      (`app-a.203-0-113-7.sslip.io` resolves to `203.0.113.7`). Gives real
      hostnames, SNI and `Host` routing on a single port with no DNS setup.
      **Recommended for multiple apps on one port.**
+
+### 5.2a Stack-agnostic port model (decided)
+
+hostip must work for **any** app on **any** given port without knowing its
+stack. Therefore routing is **by port**, and the **public port mirrors the
+local port** (local 3000 → `https://<public-ip>:3000`). Mirroring keeps
+apps working that build URLs from their own port, and it needs no base-path
+support from the app. One Let's Encrypt IP certificate covers every port.
+
+| Mode | What hostip does | Use for |
+|------|------------------|---------|
+| `auto` *(default for TCP)* | TLS-terminate with the IP cert; if the decrypted stream is HTTP → HTTP reverse proxy, otherwise raw TCP pipe | Any web app, API, WebSocket/SSE signaling, and unknown TCP protocols |
+| `https` | TLS-terminate + HTTP reverse proxy (forwarded headers, redirect rewrite, streaming) | Force HTTP handling |
+| `tls` | TLS-terminate + raw TCP pipe | Non-HTTP TCP protocols that should be encrypted |
+| `tcp` | No TLS; map router port + firewall rule, raw TCP pipe or direct forward | Apps that do their own TLS (e.g. TURN-over-TLS using the exported cert, F28) |
+| `udp` | Map router port/range via UPnP + Windows Firewall rule; traffic goes **directly** to the app (no relay hop, source addresses preserved) | WebRTC media, TURN/STUN (UDP) |
+
+**Generic limits (no stack knowledge):**
+- WebRTC media servers must announce the public IP themselves. Most do via
+  STUN or an "external IP" setting; hostip provides the IP through
+  `public_ip.txt`, the `HOSTIP_PUBLIC_IP` environment variable and the
+  `on_ip_change` hook (F27) so any stack can consume it.
+- Apps that hard-code `http://localhost` into page bodies or JavaScript
+  can't be fixed without rewriting bodies — out of scope; only redirect
+  headers are rewritten (F33).
+- Port 443 is owned by hostip (TLS-ALPN-01 challenge); an app wanting 443
+  is simply published through hostip on 443. Port 80 is used for HTTP-01
+  and redirects.
 
 ### 5.3 Network — **Feasible on most home connections, blocked on some**
 
@@ -384,55 +417,61 @@ project for async Rust and TLS.
 
 ## 8. Example configuration (draft)
 
+Quick start (no config file):
+
+```
+hostip expose 3000 8080 7880 udp:3478 udp:50000-60000
+```
+
+Equivalent config file:
+
 ```toml
 [server]
-listen = "0.0.0.0:443"         # 443 needed for ACME TLS-ALPN-01
-redirect_http = true           # listen on :80: HTTP-01 challenges + redirect
+redirect_http = true           # :80 for HTTP-01 challenges + redirect to https
 
 [tls]
 mode = "acme"                  # "acme" | "self-signed" | "local-ca" | "files"
-dir = "~/.hostip/certs"
+dir = 'C:\ProgramData\hostip\certs'
 acme_identifiers = ["ip"]      # bare public IP, Let's Encrypt short-lived profile
 renew_before = "4d"            # renew well before the ~6-day expiry
 acme_email = "you@example.com"
 fallback = "self-signed"       # used if ACME fails; logged as a warning
 
-[tls.export]                   # for TURN-over-TLS (F28)
+[tls.export]                   # optional: let apps reuse the IP cert (F28)
 cert = 'C:\ProgramData\hostip\export\cert.pem'
 key  = 'C:\ProgramData\hostip\export\key.pem'
-on_cert_renew = 'powershell -File C:\hostip\reload-turn.ps1'
+on_cert_renew = 'powershell -File C:\hostip\on-cert-renew.ps1'
 
 [network]
 upnp = true
 public_ip_sources = ["https://api.ipify.org", "https://ifconfig.me/ip"]
 ip_check_interval = "60s"
 ip_file = 'C:\ProgramData\hostip\public_ip.txt'
-on_ip_change = 'powershell -File C:\hostip\restart-sfu.ps1'   # receives HOSTIP_PUBLIC_IP env var
+on_ip_change = 'powershell -File C:\hostip\on-ip-change.ps1'   # receives HOSTIP_PUBLIC_IP
 
-[[udp_mapping]]                # WebRTC media -> SFU, mapped on the router (F26)
-name = "livekit-media"
-ports = "50000-50100"
-
-[[udp_mapping]]
-name = "turn"
-ports = "3478"
-
-[[app]]
-name = "polls"                 # live polling app (WebSocket/SSE)
-upstream = "http://127.0.0.1:3000"
-route = { path = "/polls" }
+# Any app, any stack: just list ports. Public port = local port by default.
+[[port]]
+local = 3000                   # e.g. polling app
+mode = "auto"
 idle_timeout = "30m"
 
-[[app]]
-name = "meet"                  # conferencing web UI + signaling
-upstream = "http://127.0.0.1:8080"
-route = { path = "/meet" }
+[[port]]
+local = 8080                   # e.g. conferencing web UI
+mode = "auto"
 idle_timeout = "2h"
 
-[[app]]
-name = "livekit-signal"        # LiveKit WebSocket signaling
-upstream = "http://127.0.0.1:7880"
-route = { port = 7443 }        # separate port: LiveKit expects to own its root path
+[[port]]
+local = 7880                   # e.g. conferencing signaling (WebSocket)
+public = 7443                  # optional: different public port
+mode = "auto"
+
+[[port]]
+local = "3478"                 # TURN/STUN
+protocol = "udp"
+
+[[port]]
+local = "50000-60000"          # WebRTC media range
+protocol = "udp"
 ```
 
 ## 9. Decisions and open questions
@@ -447,15 +486,11 @@ route = { port = 7443 }        # separate port: LiveKit expects to own its root 
 - Public IP: **dynamic**; no static IP available from the ISP.
 - Host OS: **Windows**; hostip runs as a Windows service.
 - Apps: polling and conferencing apps **already exist** — hostip only
-  publishes them.
-- Scale: **~100 participants per call**.
+  publishes them, **stack-agnostically, by port** (§5.2a).
+- Scale: **~100 participants in one call** (one large call at a time).
+- Certificate: **stay with the bare-IP certificate** (no domain / DDNS);
+  shared links change when the IP changes — accepted.
+- Router: can forward 443, 80 and UDP ranges, and **supports UPnP**.
 
 **Open**
-1. Which existing apps exactly (names / stack, which SFU) and on which
-   local ports do they listen? Needed for routing and port mapping.
-2. "100" = 100 people in one call, or 100 simultaneous calls? (The latter
-   does not fit a home connection.)
-3. Domain name + dynamic DNS instead of the bare-IP certificate, so links
-   survive IP changes? (Recommended.)
-4. Can the router forward 443, 80 and a UDP range to the PC, and does it
-   support UPnP?
+- None blocking. Requirements are ready for implementation (M1).
