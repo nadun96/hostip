@@ -21,6 +21,13 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Install Pebble (ACME test CA)
+        if: runner.os == 'Linux'
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - if: runner.os == 'Linux'
+        run: go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test

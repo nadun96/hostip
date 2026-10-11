@@ -1,7 +1,7 @@
 //! Certificate storage and hot-swappable serving.
 //!
-//! M1 provides the self-signed fallback (F4). The Let's Encrypt bare-IP
-//! certificate (F17) plugs into the same [`CertStore`] later.
+//! The self-signed certificate (F4) is served until the Let's Encrypt bare-IP
+//! certificate (F17, see [`crate::acme`]) is issued and swapped in.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::pem::PemObject;
@@ -18,6 +18,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
+use tokio::sync::watch;
 
 const CERT_FILE: &str = "self-signed.pem";
 const KEY_FILE: &str = "self-signed.key";
@@ -40,7 +41,17 @@ pub struct CertInfo {
     pub sans: Vec<String>,
     pub not_after: OffsetDateTime,
     pub cert_path: PathBuf,
+    pub key_path: PathBuf,
     pub generated: bool,
+}
+
+impl CertInfo {
+    pub fn read_pem(&self) -> Result<PemPair> {
+        Ok(PemPair {
+            chain: std::fs::read_to_string(&self.cert_path)?,
+            key: std::fs::read_to_string(&self.key_path)?,
+        })
+    }
 }
 
 impl fmt::Display for CertInfo {
@@ -55,26 +66,76 @@ impl fmt::Display for CertInfo {
     }
 }
 
+/// ALPN protocol used by ACME TLS-ALPN-01 validation (RFC 8737).
+pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
+
 /// Serves whichever certificate is current; swapping it never drops connections.
 #[derive(Debug)]
 pub struct CertStore {
     current: ArcSwap<CertifiedKey>,
+    /// PEM text of `current`, when known (for exporting it to other programs, F28).
+    current_pem: ArcSwapOption<PemPair>,
+    /// Answer for a pending TLS-ALPN-01 challenge, if any.
+    acme_challenge: ArcSwapOption<CertifiedKey>,
+    /// Bumped on every replacement.
+    changes: watch::Sender<u64>,
+}
+
+/// A certificate chain and its private key as PEM text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PemPair {
+    pub chain: String,
+    pub key: String,
 }
 
 impl CertStore {
     pub fn new(key: CertifiedKey) -> Arc<Self> {
         Arc::new(Self {
             current: ArcSwap::from_pointee(key),
+            current_pem: ArcSwapOption::empty(),
+            acme_challenge: ArcSwapOption::empty(),
+            changes: watch::Sender::new(0),
         })
     }
 
     pub fn replace(&self, key: CertifiedKey) {
         self.current.store(Arc::new(key));
+        self.current_pem.store(None);
+        self.changes.send_modify(|n| *n += 1);
+    }
+
+    pub fn replace_with_pem(&self, key: CertifiedKey, pem: PemPair) {
+        self.current.store(Arc::new(key));
+        self.current_pem.store(Some(Arc::new(pem)));
+        self.changes.send_modify(|n| *n += 1);
+    }
+
+    pub fn current_pem(&self) -> Option<Arc<PemPair>> {
+        self.current_pem.load_full()
+    }
+
+    /// Notifies on every certificate replacement.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    pub fn current(&self) -> Arc<CertifiedKey> {
+        self.current.load_full()
+    }
+
+    pub fn set_acme_challenge(&self, key: Option<CertifiedKey>) {
+        self.acme_challenge.store(key.map(Arc::new));
     }
 }
 
 impl ResolvesServerCert for CertStore {
-    fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let is_acme = hello
+            .alpn()
+            .is_some_and(|mut protocols| protocols.any(|p| p == ACME_TLS_ALPN));
+        if is_acme {
+            return self.acme_challenge.load_full();
+        }
         Some(self.current.load_full())
     }
 }
@@ -95,6 +156,7 @@ pub fn load_or_generate(dir: &Path, sans: &[String]) -> Result<(CertifiedKey, Ce
             sans: meta.sans.into_iter().collect(),
             not_after: OffsetDateTime::from_unix_timestamp(meta.not_after)?,
             cert_path,
+            key_path,
             generated: false,
         };
         return Ok((key, info));
@@ -115,6 +177,7 @@ pub fn load_or_generate(dir: &Path, sans: &[String]) -> Result<(CertifiedKey, Ce
         sans: wanted.into_iter().collect(),
         not_after,
         cert_path,
+        key_path,
         generated: true,
     };
     Ok((key, info))
@@ -127,6 +190,7 @@ pub fn stored_info(dir: &Path) -> Option<CertInfo> {
         sans: meta.sans.into_iter().collect(),
         not_after: OffsetDateTime::from_unix_timestamp(meta.not_after).ok()?,
         cert_path: dir.join(CERT_FILE),
+        key_path: dir.join(KEY_FILE),
         generated: false,
     })
 }
@@ -149,6 +213,14 @@ fn generate(sans: &BTreeSet<String>) -> Result<(String, String, OffsetDateTime)>
     Ok((cert.pem(), key.serialize_pem(), params.not_after))
 }
 
+/// Builds a rustls signing key from PEM text.
+pub fn certified_key_from_pem(chain_pem: &str, key_pem: &str) -> Result<CertifiedKey> {
+    let certs =
+        CertificateDer::pem_slice_iter(chain_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())?;
+    Ok(CertifiedKey::new(certs, any_supported_type(&key)?))
+}
+
 /// Builds a rustls signing key from PEM files.
 pub fn load_pem(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
     let certs = CertificateDer::pem_file_iter(cert_path)
@@ -160,7 +232,7 @@ pub fn load_pem(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
 }
 
 /// Writes a private key readable only by the current user (S6).
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;

@@ -17,9 +17,10 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_util::sync::CancellationToken;
 
+use hostip::access::{AccessConfig, AuthConfig, Guard, Limits};
 use hostip::cert::{self, CertStore};
 use hostip::config::{Mode, PortRange, PortSpec};
-use hostip::server::Server;
+use hostip::server::{Server, ServerOptions};
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -60,6 +61,11 @@ async fn upstream_handler(
             header("host"),
             header("x-forwarded-for"),
             header("x-forwarded-proto"),
+        ))),
+        "/headers" => Response::new(Full::from(format!(
+            "authorization={} cookie={}",
+            header("authorization"),
+            header("cookie"),
         ))),
         "/redirect" => Response::builder()
             .status(StatusCode::FOUND)
@@ -123,6 +129,21 @@ impl Drop for Hostip {
 }
 
 async fn start_hostip(mode: Mode, upstream_port: u16) -> Hostip {
+    start_hostip_with(
+        mode,
+        upstream_port,
+        AccessConfig::default(),
+        Limits::default(),
+    )
+    .await
+}
+
+async fn start_hostip_with(
+    mode: Mode,
+    upstream_port: u16,
+    access: AccessConfig,
+    limits: Limits,
+) -> Hostip {
     let dir = tempfile::tempdir().unwrap();
     let (key, info) =
         cert::load_or_generate(dir.path(), &["localhost".into(), "127.0.0.1".into()]).unwrap();
@@ -131,10 +152,22 @@ async fn start_hostip(mode: Mode, upstream_port: u16) -> Hostip {
         roots.add(c.unwrap()).unwrap();
     }
 
-    let spec = PortSpec::new(mode, PortRange::single(upstream_port), None, Some(0), None).unwrap();
-    let server = Server::bind(&[spec], LOCALHOST, CertStore::new(key), "127.0.0.1")
-        .await
-        .unwrap();
+    let mut spec =
+        PortSpec::new(mode, PortRange::single(upstream_port), None, Some(0), None).unwrap();
+    spec.access = access;
+    let options = ServerOptions {
+        guard: Guard::new(limits),
+        access_log: false,
+    };
+    let server = Server::bind_with(
+        &[spec],
+        LOCALHOST,
+        CertStore::new(key),
+        "127.0.0.1",
+        options,
+    )
+    .await
+    .unwrap();
     let addr = server.local_addrs()[0].1;
     let shutdown = CancellationToken::new();
     tokio::spawn(server.serve(shutdown.clone()));
@@ -348,4 +381,211 @@ async fn reports_bad_gateway_when_app_is_down() {
     let resp = client.send_request(get("x", "/")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(body_text(resp).await, "hostip: upstream unavailable\n");
+}
+
+fn with_auth() -> AccessConfig {
+    AccessConfig {
+        auth: Some(AuthConfig::parse_cli("alice:s3cret").unwrap()),
+        ..AccessConfig::default()
+    }
+}
+
+fn basic(user_pass: &str) -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(user_pass)
+    )
+}
+
+#[tokio::test]
+async fn login_protects_the_app_and_sets_a_session_cookie() {
+    let up = start_http_upstream().await;
+    let hostip = start_hostip_with(Mode::Auto, up, with_auth(), Limits::default()).await;
+    let mut client = hostip.http1().await;
+
+    let resp = client.send_request(get("x", "/echo")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        resp.headers()["www-authenticate"]
+            .to_str()
+            .unwrap()
+            .starts_with("Basic")
+    );
+
+    let mut req = get("x", "/echo");
+    req.headers_mut()
+        .insert("authorization", basic("alice:s3cret").parse().unwrap());
+    let resp = client.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = resp.headers()["set-cookie"].to_str().unwrap().to_owned();
+    assert!(
+        cookie.contains("HttpOnly") && cookie.contains("Secure"),
+        "{cookie}"
+    );
+    let session = cookie.split(';').next().unwrap().to_owned();
+
+    // The cookie alone works, and the app never sees hostip's credentials.
+    let mut req = get("x", "/headers");
+    req.headers_mut()
+        .insert("cookie", format!("{session}; theme=dark").parse().unwrap());
+    req.headers_mut()
+        .insert("authorization", "Bearer app-token".parse().unwrap());
+    let resp = client.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(resp).await,
+        "authorization=Bearer app-token cookie=theme=dark"
+    );
+}
+
+#[tokio::test]
+async fn blocks_repeated_failed_logins() {
+    let up = start_http_upstream().await;
+    let limits = Limits {
+        auth_failures_before_block: 3,
+        ..Limits::default()
+    };
+    let hostip = start_hostip_with(Mode::Https, up, with_auth(), limits).await;
+    let mut client = hostip.http1().await;
+    for _ in 0..3 {
+        let mut req = get("x", "/echo");
+        req.headers_mut()
+            .insert("authorization", basic("alice:guess").parse().unwrap());
+        let resp = client.send_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    // Even the right password is refused while blocked.
+    let mut req = get("x", "/echo");
+    req.headers_mut()
+        .insert("authorization", basic("alice:s3cret").parse().unwrap());
+    let resp = client.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn login_ports_refuse_raw_tcp() {
+    let up = start_echo_upstream().await;
+    let hostip = start_hostip_with(Mode::Auto, up, with_auth(), Limits::default()).await;
+    let mut tls = hostip.tls(&[]).await;
+    tls.write_all(b"\x00raw").await.unwrap();
+    let mut buf = Vec::new();
+    // The connection is closed without anything reaching the app.
+    let n = tls.read_to_end(&mut buf).await.unwrap_or(0);
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn deny_list_drops_connections() {
+    let up = start_http_upstream().await;
+    let access = AccessConfig {
+        deny: vec!["127.0.0.0/8".parse().unwrap()],
+        ..AccessConfig::default()
+    };
+    let hostip = start_hostip_with(Mode::Auto, up, access, Limits::default()).await;
+    let mut tcp = TcpStream::connect(hostip.addr).await.unwrap();
+    let mut buf = [0u8; 1];
+    assert_eq!(tcp.read(&mut buf).await.unwrap_or(0), 0);
+}
+
+#[tokio::test]
+async fn caps_simultaneous_connections_per_port() {
+    let up = start_echo_upstream().await;
+    let access = AccessConfig {
+        max_connections: Some(1),
+        ..AccessConfig::default()
+    };
+    let hostip = start_hostip_with(Mode::Tcp, up, access, Limits::default()).await;
+    let mut first = TcpStream::connect(hostip.addr).await.unwrap();
+    first.write_all(b"a").await.unwrap();
+    let mut buf = [0u8; 1];
+    first.read_exact(&mut buf).await.unwrap();
+
+    let mut second = TcpStream::connect(hostip.addr).await.unwrap();
+    assert_eq!(
+        second.read(&mut buf).await.unwrap_or(0),
+        0,
+        "second is closed"
+    );
+
+    drop(first);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut third = TcpStream::connect(hostip.addr).await.unwrap();
+    third.write_all(b"c").await.unwrap();
+    third.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"c");
+}
+
+#[test]
+fn example_config_is_valid() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/hostip.toml");
+    let file = hostip::config::FileConfig::load(std::path::Path::new(path)).unwrap();
+    let specs = file.port_specs().unwrap();
+    hostip::config::validate_specs(&specs).unwrap();
+    assert_eq!(specs.len(), 4);
+}
+
+/// An app that serves HTTPS itself, with its own self-signed certificate.
+async fn start_https_upstream(dir: &std::path::Path) -> u16 {
+    let (key, _) = cert::load_or_generate(dir, &["localhost".into()]).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_cert_resolver(CertStore::new(key));
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind((LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(|_req: Request<Incoming>| async {
+                    Ok::<_, Infallible>(Response::new(Full::<Bytes>::from("secure upstream")))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(tls), service)
+                    .await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn proxies_to_apps_that_serve_https_themselves() {
+    let app_dir = tempfile::tempdir().unwrap();
+    let up = start_https_upstream(app_dir.path()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (key, info) = cert::load_or_generate(dir.path(), &["127.0.0.1".into()]).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_file_iter(&info.cert_path).unwrap() {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let mut spec = PortSpec::new(Mode::Auto, PortRange::single(up), None, Some(0), None).unwrap();
+    spec.upstream_tls = true;
+    let server = Server::bind(&[spec], LOCALHOST, CertStore::new(key), "127.0.0.1")
+        .await
+        .unwrap();
+    let addr = server.local_addrs()[0].1;
+    let shutdown = CancellationToken::new();
+    tokio::spawn(server.serve(shutdown.clone()));
+    let hostip = Hostip {
+        addr,
+        roots,
+        shutdown,
+        _dir: dir,
+    };
+
+    let mut client = hostip.http1().await;
+    let resp = client.send_request(get("x", "/")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_text(resp).await, "secure upstream");
 }
