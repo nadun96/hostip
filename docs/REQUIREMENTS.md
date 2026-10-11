@@ -29,7 +29,12 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 
 ### Non-goals (v1)
 - Traversing CGNAT / double NAT without a relay (see §5.3 — needs a VPS).
-- Raw TCP/UDP forwarding (games, SSH, databases).
+- Proxying raw TCP/UDP itself (games, SSH, databases). WebRTC media goes
+  **directly** from the router to the conferencing media server's UDP ports;
+  hostip only *opens/maps* those ports and keeps the server's public IP
+  up to date (§5.5b).
+- Implementing a WebRTC media server (SFU) or TURN server from scratch —
+  integrate an existing one (LiveKit, mediasoup, Jitsi, coturn).
 - Being a general-purpose production load balancer.
 
 ---
@@ -62,6 +67,11 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 | F22 | **Streaming:** separate timeouts — short header/handshake timeout, but no total-request timeout and a generous idle timeout (configurable per app) so long-lived streams aren't cut. | Must |
 | F23 | **Streaming:** per-app limits on concurrent viewers/connections and optional per-client bandwidth cap, to protect home upload bandwidth. | Should |
 | F24 | Disable response compression for media types (video/audio already compressed) and never rewrite media bodies. | Should |
+| F25 | **Real-time web:** WebSocket, SSE and HTTP long-polling stay open indefinitely while active (live poll results, chat, conferencing signaling); no response buffering for `text/event-stream`. | Must |
+| F26 | **WebRTC port mapping:** map the media server's UDP port range (and TCP fallback port) on the router via UPnP/NAT-PMP, renew leases, remove on exit; print exact manual port-forward rules when UPnP is unavailable. | Must |
+| F27 | **Public-IP propagation:** on start and on every IP change, expose the current public IP to apps — write it to a file, set it in an env file, and run a configurable `on_ip_change` hook (e.g. restart/reconfigure the SFU so it announces the new IP in ICE candidates). | Must |
+| F28 | **Certificate export:** write the current IP certificate + key as PEM to a configurable path (and run `on_cert_renew` hook) so a TURN-over-TLS server can reuse the same trusted cert. | Should |
+| F29 | Self-test for conferencing: verify from outside that 443/TCP and the UDP media range are reachable (via a lightweight STUN/echo check). | Should |
 
 ## 3. Security requirements
 
@@ -75,14 +85,18 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 | S6 | Private key files written with `0600` permissions (ACL on Windows). | Must |
 | S7 | Strip hop-by-hop headers; don't leak internal upstream addresses in errors. | Must |
 | S8 | Access log with client IP, status, latency; failed-auth logging. | Should |
-| S9 | Run without root: document `setcap cap_net_bind_service` on Linux, or use a high port. | Must |
+| S9 | Least privilege: on Windows run the service as a dedicated low-privilege account / `LocalService` (binding 443 needs no admin on Windows; only firewall/service install does). On Linux use `setcap cap_net_bind_service`. | Must |
 
 ## 4. Non-functional requirements
 
 | Area | Target |
 |------|--------|
-| Platforms | Linux x86_64/aarch64, macOS (arm64/x86_64), Windows x86_64 |
-| Distribution | Single binary, no runtime deps; `cargo install`, GitHub Releases |
+| Platforms | **Windows 10/11 x86_64 is the primary target** (owner's host); Linux and macOS secondary |
+| Windows service | Run as a Windows service (`windows-service` crate) with auto-start and auto-restart; also runnable in a console for debugging |
+| Windows firewall | `hostip install` adds inbound Windows Defender Firewall rules for 443/TCP, 80/TCP and the media UDP range (admin rights, one-time); `hostip uninstall` removes them |
+| Windows paths/ACL | Config and certs under `%ProgramData%\hostip`; private keys readable only by SYSTEM and Administrators |
+| Windows port conflicts | Detect if 443/80 are already taken (IIS/HTTP.sys, Skype, VMware, other servers) and name the owning process |
+| Distribution | Single binary, no runtime deps; signed `.exe` + MSI installer or `winget`; `cargo install` and GitHub Releases for other OSes |
 | Performance | ≥ 5k req/s and < 2 ms added p99 latency on a typical laptop for small responses |
 | Streaming throughput | Saturate a 1 Gbit/s link with TLS on a modern CPU (the home **upload** bandwidth is the real bottleneck); time-to-first-byte overhead < 5 ms |
 | Streaming memory | Bounded per-connection buffers (≤ 64–256 KiB) regardless of stream length or size |
@@ -215,17 +229,56 @@ plain reverse-proxy workload: hyper bodies are already streams, so F20–F24
 are mostly about *not* doing harmful things (buffering, compressing,
 total-request timeouts).
 
-- **Not covered by an HTTP proxy:** WebRTC (UDP media, needs STUN/TURN and
-  UDP port forwarding) and RTMP/SRT ingest (raw TCP/UDP, e.g. OBS → server).
-  If needed, these require a separate TCP/UDP forwarding mode (v2).
+- **Not carried by the HTTP proxy:** WebRTC media (UDP) — handled in §5.5b.
 - **Capacity math (home upload is the bottleneck):** viewers ≈ upload
-  bandwidth ÷ stream bitrate. Example: 20 Mbit/s upload ÷ 5 Mbit/s 1080p ≈
-  **3–4 simultaneous viewers**; 720p at 2.5 Mbit/s ≈ 7. Live streams should
-  offer lower-bitrate renditions (HLS adaptive bitrate) and F23 limits.
+  bandwidth ÷ stream bitrate. With **300 Mbit/s upload**, ~50 viewers of a
+  5 Mbit/s 1080p stream or ~100 at 720p (keep ~20 % headroom).
 - **Proxy design notes:** use `hyper` streaming bodies end-to-end, keep
   HTTP/2 flow-control windows reasonable for high-bitrate streams, disable
   Nagle (`TCP_NODELAY`) for low-latency live streams, and enforce the
   connection cap before accepting more viewers.
+
+### 5.5b Live polling + video conferencing — **Feasible with an existing SFU; dynamic IP is the main weakness**
+
+The workload is a **live polling app** and a **video conferencing app**.
+
+**Polling app** — plain HTTPS + WebSocket/SSE/long-polling through hostip
+(F25). Trivial bandwidth; feasible, no special work.
+
+**Video conferencing (WebRTC)** has two halves:
+
+| Part | Transport | Who handles it |
+|------|-----------|----------------|
+| Web UI, signaling, room API | HTTPS + WebSocket on 443 | **hostip reverse proxy** |
+| Audio/video media | UDP (e.g. 50000–60000 or a single mux port), TCP fallback | **SFU directly** (router → PC), ports mapped by hostip (F26) |
+| Clients behind strict firewalls | TURN over UDP 3478 / TLS 5349 (or 443) | TURN server (coturn, or the SFU's built-in TURN) using hostip's exported cert (F28) |
+
+- **Trusted certificate is mandatory, not nice-to-have:** browsers only allow
+  camera/microphone (`getUserMedia`) in a secure context, so the Let's
+  Encrypt IP certificate is essential for conferencing.
+- **Recommended SFU on Windows:** **LiveKit** (single binary with Windows
+  builds, built-in TURN, `use_external_ip`/`node_ip` setting, good SDKs) or
+  **mediasoup** (Node.js library, runs on Windows, more DIY). Jitsi works
+  best on Linux/Docker. Rust options (`webrtc-rs`, `str0m`) exist but would
+  mean building the SFU yourself — out of scope.
+- **SFU must announce the public IP** in ICE candidates — hence F27
+  (IP propagation + `on_ip_change` hook to update/restart the SFU).
+- **Capacity with 300 Mbit/s upload** (SFU forwards every stream to every
+  other participant; upload ≈ N × (N−1) × bitrate):
+  - Everyone sees everyone at 720p (~1.5 Mbit/s): **~12–14 participants** in
+    one room.
+  - With simulcast (active speaker in HD, others as ~0.3 Mbit/s thumbnails):
+    **~25–30 participants**.
+  - Audio-only: hundreds. Confirm 300 Mbit/s is the **upload** figure — many
+    home plans are asymmetric (e.g. 300 down / 50 up → ~5–6 people at 720p).
+- **Dynamic IP impact:** when the ISP changes the IP, every in-progress call
+  drops (media is addressed to the old IP), the SFU must restart with the new
+  IP, a new certificate must be issued (~seconds–minutes), and shared links
+  change. Usually rare (days–weeks, often on router reboot), but **a static
+  IP from the ISP is strongly recommended** for conferencing with others.
+- **Home PC caveats:** the PC must stay on and awake (disable sleep), and
+  SFU CPU load grows with participants (fine for tens of users on a modern
+  desktop).
 
 ### 5.5 Security / operational — **Feasible, needs care**
 
@@ -255,9 +308,11 @@ project for async Rust and TLS.
 | Technical | ✅ High — mature crates, well-understood problem |
 | Network | ✅ High for the owner (not behind CGNAT); ⚠️ for other users of the tool behind CGNAT |
 | Trusted TLS for public visitors | ✅ High with Let's Encrypt bare-IP cert (needs port 443/80 forwarded; ~6-day certs need reliable renewal); ❌ not achievable with self-signed alone |
-| Streaming | ✅ High for HTTP-based streaming; limited by home upload bandwidth; ❌ WebRTC/RTMP need a separate mode |
+| Live polling | ✅ High — WebSocket/SSE through the proxy |
+| Video conferencing | ✅ Feasible using an existing SFU (LiveKit/mediasoup) + hostip for TLS, signaling, port mapping and IP propagation; ~12–30 people per room on 300 Mbit/s upload; ⚠️ calls drop on IP change |
+| Windows host | ✅ High — Rust, rustls, UPnP, Windows service and firewall APIs all supported |
 | Security | ⚠️ Medium — manageable with the defaults above |
-| **Overall** | **Feasible.** Ship a streaming-safe reverse proxy + Let's Encrypt bare-IP certificates (self-signed fallback) in v1, with path/port routing. |
+| **Overall** | **Feasible.** Ship a Windows-first, real-time-safe reverse proxy with Let's Encrypt bare-IP certificates, UDP port mapping and public-IP propagation for an existing SFU. Get a static IP if possible. |
 
 ---
 
@@ -270,7 +325,11 @@ project for async Rust and TLS.
 | Browser warnings make it unusable for others | High (self-signed) | High | ACME by default (F17); self-signed only as fallback |
 | ACME challenge fails (ports 80/443 blocked, rate limits) | Medium | High | TLS-ALPN-01 on 443, HTTP-01 fallback, clear diagnostics, self-signed fallback, own-domain option |
 | Short-lived IP cert expires (renewal outage) | Medium | High | Renew at ~⅓–½ lifetime, retry with backoff, alert in logs/status |
-| Home IP changes (dynamic IP) | Medium–High | High | IP watcher → immediate new cert + new URL (F19); ask ISP for static IP |
+| Home IP changes (dynamic IP) | Medium–High | High | IP watcher → immediate new cert + new URL (F19), `on_ip_change` restarts SFU (F27); ask ISP for static IP |
+| Calls drop when IP changes | Medium | High | Fast detection (poll every 30–60 s + router UPnP external-IP query), quick SFU restart, client auto-reconnect in the app |
+| Participants behind strict corporate/school firewalls (UDP blocked) | Medium | Medium | TURN over TLS (ideally on 443), SFU TCP fallback |
+| Advertised "300 Mbps" is download only | Medium | High | Measure upload; size room limits accordingly |
+| Windows sleep/updates restart the PC | Medium | Medium | Service auto-start, disable sleep, schedule update restarts |
 | Upload bandwidth saturated by viewers | High | Medium | Viewer/connection caps, per-client bandwidth caps, adaptive-bitrate streams |
 | Router/ISP blocks or reserves port 443 (router admin UI, ISP policy) | Medium | High | Move router admin off 443/disable WAN admin; diagnostics in self-test |
 | Public IP changes break links/cert | Medium | Medium | IP watcher + cert regen; sslip.io hostnames |
@@ -286,11 +345,12 @@ project for async Rust and TLS.
 | **M1 — MVP** | CLI quick mode, TOML config, port-based routing, self-signed cert with IP SANs, HTTP/1.1 + WebSocket proxy, forwarded headers, graceful shutdown | 1–2 weeks |
 | **M1.5 — Trusted TLS + streaming** | Let's Encrypt bare-IP cert (TLS-ALPN-01 + HTTP-01, short-lived profile), auto-renew + hot-swap, IP-change re-issue, share URL; streaming-safe bodies, Range passthrough, streaming timeouts | ~1–1.5 weeks |
 | **M2 — Safe by default** | Basic/token auth, rate limiting, timeouts/limits, IP allow/deny, access logs, key file permissions | 1 week |
+| **M2.5 — Conferencing & Windows** | UDP port-range mapping via UPnP (F26), IP propagation + hooks (F27), cert export (F28), Windows service, firewall-rule install, port-conflict detection, LiveKit integration guide | ~1.5 weeks |
 | **M3 — Convenience** | Local CA mode + export, viewer/bandwidth caps, public-IP watcher + cert regen, reachability/CGNAT self-test, UPnP/NAT-PMP, HTTP/2, path routing, hot reload | 1–2 weeks |
 | **M4 — Distribution** | Cross-platform CI, release binaries, docs, integration tests | ~1 week |
-| **v2 (optional)** | Raw TCP/UDP forwarding (RTMP/SRT ingest, WebRTC/TURN), sslip.io or own-domain hostnames, IPv6, VPS relay for CGNAT, web dashboard | 2–4 weeks |
+| **v2 (optional)** | Raw TCP/UDP proxying (RTMP/SRT ingest), TURN/HTTPS multiplexing on 443 (ALPN), sslip.io or own-domain hostnames, IPv6, VPS relay for CGNAT, web dashboard | 2–4 weeks |
 
-**Usable public v1: ~5–7 weeks of focused work.**
+**Usable public v1: ~6–9 weeks of focused work** (excluding building the polling and conferencing apps themselves).
 
 ---
 
@@ -309,23 +369,42 @@ renew_before = "4d"            # renew well before the ~6-day expiry
 acme_email = "you@example.com"
 fallback = "self-signed"       # used if ACME fails; logged as a warning
 
+[tls.export]                   # for TURN-over-TLS (F28)
+cert = 'C:\ProgramData\hostip\export\cert.pem'
+key  = 'C:\ProgramData\hostip\export\key.pem'
+on_cert_renew = 'powershell -File C:\hostip\reload-turn.ps1'
+
 [network]
 upnp = true
 public_ip_sources = ["https://api.ipify.org", "https://ifconfig.me/ip"]
+ip_check_interval = "60s"
+ip_file = 'C:\ProgramData\hostip\public_ip.txt'
+on_ip_change = 'powershell -File C:\hostip\restart-sfu.ps1'   # receives HOSTIP_PUBLIC_IP env var
+
+[[udp_mapping]]                # WebRTC media -> SFU, mapped on the router (F26)
+name = "livekit-media"
+ports = "50000-50100"
+
+[[udp_mapping]]
+name = "turn"
+ports = "3478"
 
 [[app]]
-name = "media"                 # e.g. Jellyfin with Base URL = /media
-upstream = "http://127.0.0.1:8096"
-route = { path = "/media" }
-idle_timeout = "10m"           # long-lived streams
-max_connections = 6            # protect home upload bandwidth
-auth = { basic = { user = "me", password_hash = "$argon2id$..." } }
+name = "polls"                 # live polling app (WebSocket/SSE)
+upstream = "http://127.0.0.1:3000"
+route = { path = "/polls" }
+idle_timeout = "30m"
 
 [[app]]
-name = "api"
+name = "meet"                  # conferencing web UI + signaling
 upstream = "http://127.0.0.1:8080"
-route = { path = "/api" }
-allow = ["203.0.113.0/24"]
+route = { path = "/meet" }
+idle_timeout = "2h"
+
+[[app]]
+name = "livekit-signal"        # LiveKit WebSocket signaling
+upstream = "http://127.0.0.1:7880"
+route = { port = 7443 }        # separate port: LiveKit expects to own its root path
 ```
 
 ## 9. Decisions and open questions
@@ -335,14 +414,16 @@ allow = ["203.0.113.0/24"]
   certs are a v1 requirement; self-signed is fallback only.
 - Certificate: **Let's Encrypt certificate for the bare public IP**.
 - Host: **home PC**, **not behind CGNAT** → router port forwarding of 443 (+80).
-- Workload: **streaming** (HTTP-based); no SSH / raw TCP needed.
+- Workload: **live polling app + video conferencing app** (WebRTC); no SSH.
+- Bandwidth: **300 Mbit/s** (to be confirmed as upload).
+- Public IP: **dynamic**.
+- Host OS: **Windows**; hostip runs as a Windows service.
 
 **Open**
-1. What kind of streaming exactly — media library (Jellyfin/Plex), live
-   HLS from OBS, browser WebRTC, or files? (WebRTC/RTMP need v2 TCP/UDP mode.)
-2. What is your home **upload** speed? (Sets the realistic viewer count.)
-3. Is your home IP static or dynamic? (Dynamic = links change on IP change.)
-4. Can the router forward 443 and 80 to the PC (no ISP block, router admin
-   not on 443)?
-5. Which OS is the home PC? Should hostip run as a background service
-   (systemd / Windows service) in v1?
+1. Is 300 Mbit/s the **upload** speed (check with a speed test)?
+2. Do the polling and conferencing apps already exist, or are they being
+   built too? If built: which SFU (LiveKit recommended) and stack?
+3. Expected max participants per call and number of simultaneous calls?
+4. Can the router forward 443, 80 and a UDP range to the PC, and does it
+   support UPnP?
+5. Can you get a static IP from the ISP (strongly recommended for calls)?
