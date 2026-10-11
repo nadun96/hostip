@@ -13,10 +13,13 @@ use tracing_subscriber::EnvFilter;
 use hostip::access::{self, AuthConfig, Guard};
 use hostip::acme::{self, AcmeManager, AcmeOptions, ChallengeKind, HttpChallenges};
 use hostip::cert::{self, CertStore};
-use hostip::config::{FileConfig, Mode, PortRange, PortSpec, parse_duration, validate_specs};
+use hostip::config::{
+    FileConfig, Mode, PortRange, PortSpec, RelaySection, parse_duration, validate_specs,
+};
 use hostip::hooks::{self, CertExport, IpHooks};
 use hostip::portmap::{self, DiscoverOptions};
 use hostip::publicip;
+use hostip::relay;
 use hostip::server::{self, Server, ServerOptions};
 use hostip::service;
 
@@ -41,6 +44,8 @@ enum Command {
     },
     /// Hash a password for `password_hash` in the config file (reads it from stdin).
     HashPassword,
+    /// Run a relay on a machine with a public IP, for homes where no port can be opened.
+    Relay(RelayArgs),
     /// Run hostip in the background (Windows service or systemd unit).
     #[command(subcommand)]
     Service(ServiceCommand),
@@ -71,6 +76,25 @@ enum ServiceCommand {
         #[arg(short, long)]
         config: PathBuf,
     },
+}
+
+#[derive(Args)]
+struct RelayArgs {
+    /// Control address the home side connects to (TCP and UDP).
+    #[arg(long, default_value = "0.0.0.0:7000")]
+    listen: std::net::SocketAddr,
+    /// Shared secret; generated and saved on first start if not given.
+    #[arg(long, env = "HOSTIP_RELAY_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+    /// Ports the home side may publish, e.g. `80,443,50000-50100`.
+    #[arg(long, value_delimiter = ',', default_value = "1-65535")]
+    allow_ports: Vec<PortRange>,
+    /// This relay's public IP (detected if not given).
+    #[arg(long)]
+    public_ip: Option<IpAddr>,
+    /// Where the relay keeps its certificate and token.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Args, Default)]
@@ -139,6 +163,15 @@ struct ExposeArgs {
     /// Run this command after each certificate export (gets HOSTIP_CERT_FILE, HOSTIP_KEY_FILE).
     #[arg(long)]
     on_cert_renew: Option<String>,
+    /// Publish through this `hostip relay` (host:port) instead of opening router ports.
+    #[arg(long, requires_all = ["relay_token", "relay_fingerprint"])]
+    relay: Option<String>,
+    /// The relay's token.
+    #[arg(long, env = "HOSTIP_RELAY_TOKEN", hide_env_values = true)]
+    relay_token: Option<String>,
+    /// The relay's certificate fingerprint (printed by `hostip relay`).
+    #[arg(long)]
+    relay_fingerprint: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -188,6 +221,11 @@ async fn run(command: Command) -> Result<()> {
             }
             Ok(())
         }
+        Command::Relay(args) => {
+            let shutdown = CancellationToken::new();
+            tokio::spawn(wait_for_signal(shutdown.clone()));
+            relay_command(args, shutdown).await
+        }
         Command::Service(ServiceCommand::Install { config, system }) => {
             install_service(&config, system)
         }
@@ -208,6 +246,60 @@ async fn run(command: Command) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn relay_command(args: RelayArgs, shutdown: CancellationToken) -> Result<()> {
+    let dir = args.data_dir.unwrap_or_else(|| {
+        default_cert_dir()
+            .parent()
+            .map_or_else(|| PathBuf::from("relay"), |p| p.join("relay"))
+    });
+    std::fs::create_dir_all(&dir)?;
+    let token = match args.token {
+        Some(token) => token,
+        None => {
+            let path = dir.join("token");
+            match std::fs::read_to_string(&path) {
+                Ok(saved) => saved.trim().to_owned(),
+                Err(_) => {
+                    let token = relay::generate_token();
+                    cert::write_private(&path, token.as_bytes())?;
+                    token
+                }
+            }
+        }
+    };
+    if token.len() < 16 {
+        warn!("the relay token is short; use at least 16 random characters");
+    }
+    let public_ip = match args.public_ip {
+        Some(ip) => Some(ip),
+        None => publicip::detect(&default_sources()).await.ok(),
+    };
+    let (tls, fingerprint) = relay::relay_tls(&dir)?;
+    let host = public_ip.map_or_else(
+        || "<this-server-ip>".to_owned(),
+        |ip| url_host(&ip.to_string()),
+    );
+    println!();
+    println!("hostip relay is ready on {}.", args.listen);
+    println!("On the home PC run, for example:");
+    println!(
+        "  hostip expose 3000:443 --relay {host}:{} --relay-token {token} --relay-fingerprint {fingerprint}",
+        args.listen.port()
+    );
+    println!(
+        "Open TCP+UDP {} and the published ports in this server's firewall.",
+        args.listen.port()
+    );
+    println!();
+    let options = relay::RelayOptions {
+        listen: args.listen,
+        token,
+        public_ip,
+        allowed_ports: args.allow_ports,
+    };
+    relay::run_relay(options, tls, shutdown).await
 }
 
 /// Checks the config and returns its absolute path plus the firewall rules it needs.
@@ -359,7 +451,21 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
     } else {
         file.network.public_ip_sources.clone()
     };
-    let fixed_ip = args.public_ip.or(file.network.public_ip);
+    let relay = match (&args.relay, &file.relay) {
+        (Some(address), _) => Some(RelaySection {
+            address: address.clone(),
+            token: args.relay_token.clone().unwrap_or_default(),
+            fingerprint: args.relay_fingerprint.clone().unwrap_or_default(),
+        }),
+        (None, Some(section)) => Some(section.clone()),
+        (None, None) => None,
+    };
+    // Through a relay, visitors use the relay's address.
+    let relay_ip = match &relay {
+        Some(r) => Some(relay::resolve(&r.address).await?.ip()),
+        None => None,
+    };
+    let fixed_ip = args.public_ip.or(file.network.public_ip).or(relay_ip);
     let public_ip = match fixed_ip {
         Some(ip) => Some(ip),
         None => match publicip::detect(&sources).await {
@@ -435,7 +541,8 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
         match server
             .bind_http(
                 bind,
-                http_listen,
+                // Through a relay, port 80 arrives over the tunnel; the local port is irrelevant.
+                if relay.is_some() { 0 } else { http_listen },
                 challenges.clone(),
                 https_443.then_some(443),
             )
@@ -468,8 +575,16 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
     }
 
     server::log_ready(&server.local_addrs());
-    let upnp = !args.no_upnp && file.network.upnp.unwrap_or(true);
-    print_summary(&specs, &host, lan_ip, http_bound, acme_active, upnp);
+    let upnp = relay.is_none() && !args.no_upnp && file.network.upnp.unwrap_or(true);
+    print_summary(
+        &specs,
+        &host,
+        lan_ip,
+        http_bound,
+        acme_active,
+        upnp,
+        relay.as_ref().map(|r| r.address.as_str()),
+    );
 
     // Public IP tracking (F7, F19): only when the IP was detected, not given.
     let (ip_tx, ip_rx) = watch::channel(public_ip);
@@ -582,6 +697,33 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
         _ => None,
     };
 
+    if let Some(r) = relay {
+        let mut tcp_ports: Vec<u16> = specs
+            .iter()
+            .filter(|s| s.mode != Mode::Udp)
+            .map(|s| s.public.start)
+            .collect();
+        if http_bound.is_some() {
+            tcp_ports.push(80);
+        }
+        let options = relay::ClientOptions {
+            relay: r.address,
+            token: r.token,
+            fingerprint: r.fingerprint,
+            tcp_ports,
+            udp: specs
+                .iter()
+                .filter(|s| s.mode == Mode::Udp)
+                .map(|s| (s.public, s.local.start))
+                .collect(),
+        };
+        tokio::spawn(relay::run_client(
+            options,
+            server.injector(shutdown.clone()),
+            shutdown.clone(),
+        ));
+    }
+
     server.serve(shutdown).await;
     if let Some(task) = portmap_task {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
@@ -645,6 +787,7 @@ fn print_summary(
     http_listen: Option<u16>,
     acme: bool,
     upnp: bool,
+    relay: Option<&str>,
 ) {
     let host = url_host(host);
     let pc = lan_ip.map_or_else(|| "this PC".to_owned(), |ip| ip.to_string());
@@ -659,23 +802,27 @@ fn print_summary(
         );
     }
     println!();
-    if upnp {
-        println!(
-            "Router ports (opened automatically via UPnP / PCP / NAT-PMP if the router allows it,"
-        );
-        println!("otherwise forward them manually):");
+    if let Some(relay) = relay {
+        println!("No router setup needed: visitors arrive through the relay at {relay}.");
     } else {
-        println!("Router port forwarding needed:");
-    }
-    for s in specs {
-        let (proto, target) = match s.listen {
-            Some(listen) => ("TCP", listen.to_string()),
-            None => ("UDP", s.local.to_string()),
-        };
-        println!("  {proto} {} -> {pc}:{target}", s.public);
-    }
-    if let Some(port) = http_listen {
-        println!("  TCP 80 -> {pc}:{port}   (Let's Encrypt validation, http->https redirect)");
+        if upnp {
+            println!(
+                "Router ports (opened automatically via UPnP / PCP / NAT-PMP if the router allows it,"
+            );
+            println!("otherwise forward them manually):");
+        } else {
+            println!("Router port forwarding needed:");
+        }
+        for s in specs {
+            let (proto, target) = match s.listen {
+                Some(listen) => ("TCP", listen.to_string()),
+                None => ("UDP", s.local.to_string()),
+            };
+            println!("  {proto} {} -> {pc}:{target}", s.public);
+        }
+        if let Some(port) = http_listen {
+            println!("  TCP 80 -> {pc}:{port}   (Let's Encrypt validation, http->https redirect)");
+        }
     }
     let open_http: Vec<String> = specs
         .iter()

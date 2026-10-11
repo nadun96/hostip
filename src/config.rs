@@ -245,6 +245,8 @@ pub struct FileConfig {
     pub acme: AcmeSection,
     #[serde(default)]
     pub limits: Limits,
+    /// Publish through a `hostip relay` instead of opening router ports.
+    pub relay: Option<RelaySection>,
     #[serde(default, rename = "port")]
     pub ports: Vec<PortEntry>,
 }
@@ -296,6 +298,16 @@ pub struct NetworkSection {
     pub ip_file: Option<PathBuf>,
     /// Command run at start and on every IP change; gets HOSTIP_PUBLIC_IP and HOSTIP_PREVIOUS_IP.
     pub on_ip_change: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelaySection {
+    /// `host:port` of the relay's control port.
+    pub address: String,
+    pub token: String,
+    /// SHA-256 fingerprint printed by `hostip relay`.
+    pub fingerprint: String,
 }
 
 /// Let's Encrypt settings for the bare-IP certificate.

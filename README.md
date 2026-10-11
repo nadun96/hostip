@@ -45,8 +45,11 @@ Milestones **M1** and **M1.5** are done:
   log in `%ProgramData%\hostip\hostip.log`) and opens the Windows Firewall
   ports; on Linux it installs a hardened systemd unit
 
-Not done yet: relay mode (for networks where no port can be opened), release
-packaging.
+- **Relay mode** for networks where no port can be opened (CGNAT, no router
+  access): a small `hostip relay` on any server with a public IP; your PC dials
+  out to it, TLS still terminates on your PC, UDP media is relayed too
+
+Not done yet: release packaging.
 
 ## Usage
 
@@ -60,6 +63,7 @@ hostip hash-password   # reads a password on stdin, prints an Argon2 hash for th
 hostip ip      # show the public and LAN IP addresses
 hostip service install --config hostip.toml [--system]   # run in the background
 hostip service uninstall
+hostip relay [--listen 0.0.0.0:7000] [--token TOKEN] [--allow-ports LIST]   # on a public server
 hostip cert    # show the stored certificate
 ```
 
@@ -142,6 +146,29 @@ service and the firewall rules.
 
 On Linux the same command installs a systemd unit (`journalctl -u hostip -f`
 for logs).
+
+### When no port can be opened: relay mode
+
+If your connection is behind CGNAT, or you can't change the router, run a relay
+on any machine with a public IP (a small VPS):
+
+```
+hostip relay --listen 0.0.0.0:7000
+```
+
+It prints the exact command for the home PC, including a generated token and
+its certificate fingerprint:
+
+```
+hostip expose 3000:443 --relay 203.0.113.50:7000 --relay-token ... --relay-fingerprint ...
+```
+
+Your PC connects out to the relay, so nothing has to be opened at home. Visitors
+use the relay's IP; TLS (including the Let's Encrypt certificate for the relay's
+IP) still terminates on your PC, so the relay never sees decrypted traffic. The
+relay's certificate is pinned by fingerprint and the token authenticates your
+PC. UDP ports (WebRTC media) are relayed too. All traffic flows through the
+relay, so it needs enough bandwidth (about 200 Mbit/s for a 100-person call).
 
 ### Router port forwarding
 

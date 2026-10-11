@@ -86,9 +86,51 @@ struct HttpPortCtx {
     https_port: Option<u16>,
 }
 
+/// Any byte stream a connection can arrive on (a TCP socket, or a relay tunnel).
+pub trait Io: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Io for T {}
+
 pub struct Server {
     listeners: Vec<(Arc<PortCtx>, TcpListener)>,
     http_port: Option<(Arc<HttpPortCtx>, TcpListener)>,
+    tracker: TaskTracker,
+}
+
+/// Feeds connections that did not arrive on a local listener (relay mode) into the
+/// same handling as the listener for that public port.
+#[derive(Clone)]
+pub struct Injector {
+    ports: Arc<std::collections::HashMap<u16, Arc<PortCtx>>>,
+    http: Option<Arc<HttpPortCtx>>,
+    tracker: TaskTracker,
+    shutdown: CancellationToken,
+}
+
+impl Injector {
+    /// Handles `stream` as if it had been accepted on public port `port` from `peer`.
+    /// Returns false when nothing is published on that port or the connection is refused.
+    pub fn inject<S: Io>(&self, port: u16, stream: S, peer: SocketAddr) -> bool {
+        if port == 80
+            && let Some(http) = &self.http
+        {
+            self.tracker.spawn(serve_http_port(http.clone(), stream));
+            return true;
+        }
+        let Some(ctx) = self.ports.get(&port) else {
+            return false;
+        };
+        let Some(hold) = admit(ctx, peer) else {
+            return false;
+        };
+        self.tracker.spawn(handle_connection(
+            ctx.clone(),
+            stream,
+            peer,
+            self.shutdown.clone(),
+            hold,
+        ));
+        true
+    }
 }
 
 impl Server {
@@ -148,6 +190,7 @@ impl Server {
         Ok(Self {
             listeners,
             http_port: None,
+            tracker: TaskTracker::new(),
         })
     }
 
@@ -180,9 +223,24 @@ impl Server {
             .collect()
     }
 
+    /// A handle for injecting relayed connections; they share this server's shutdown.
+    pub fn injector(&self, shutdown: CancellationToken) -> Injector {
+        Injector {
+            ports: Arc::new(
+                self.listeners
+                    .iter()
+                    .map(|(ctx, _)| (ctx.spec.public.start, ctx.clone()))
+                    .collect(),
+            ),
+            http: self.http_port.as_ref().map(|(ctx, _)| ctx.clone()),
+            tracker: self.tracker.clone(),
+            shutdown,
+        }
+    }
+
     /// Serves until `shutdown` is cancelled, then drains connections for a short grace period.
     pub async fn serve(self, shutdown: CancellationToken) {
-        let tracker = TaskTracker::new();
+        let tracker = self.tracker;
         for (ctx, listener) in self.listeners {
             tracker.spawn(accept_loop(
                 ctx,
@@ -275,9 +333,9 @@ fn admit(ctx: &PortCtx, peer: SocketAddr) -> Option<Hold> {
     }
 }
 
-async fn handle_connection(
+async fn handle_connection<S: Io>(
     ctx: Arc<PortCtx>,
-    stream: TcpStream,
+    stream: S,
     peer: SocketAddr,
     shutdown: CancellationToken,
     hold: Hold,
@@ -295,18 +353,19 @@ async fn handle_connection(
     }
 }
 
-async fn handle_tls(
+async fn handle_tls<S: Io>(
     ctx: &PortCtx,
-    stream: TcpStream,
+    mut stream: S,
     peer: SocketAddr,
     shutdown: &CancellationToken,
     hold: &Hold,
 ) -> io::Result<()> {
     let mut first = [0u8; 1];
-    match timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first)).await {
-        Ok(Ok(1)) => {}
+    match timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut first)).await {
+        Ok(Ok(_)) => {}
         _ => return Ok(()),
     }
+    let stream = Prefixed::new(Bytes::copy_from_slice(&first), stream);
     // 0x16 = TLS handshake record. Anything else on an HTTP port is most likely plain HTTP.
     if first[0] != 0x16 {
         if ctx.spec.mode != Mode::Tls && first[0].is_ascii_uppercase() {
@@ -480,17 +539,18 @@ async fn http_port_loop(
                 }
             },
         };
-        let ctx = ctx.clone();
-        tracker.spawn(async move {
-            let service = service_fn(move |req| http_port_response(req, ctx.clone()));
-            let conn = hyper::server::conn::http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(HEADER_READ_TIMEOUT)
-                .serve_connection(TokioIo::new(stream), service);
-            if let Err(e) = conn.await {
-                debug!(error = %e, "HTTP port connection ended with error");
-            }
-        });
+        tracker.spawn(serve_http_port(ctx.clone(), stream));
+    }
+}
+
+async fn serve_http_port<S: Io>(ctx: Arc<HttpPortCtx>, stream: S) {
+    let service = service_fn(move |req| http_port_response(req, ctx.clone()));
+    let conn = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(TokioIo::new(stream), service);
+    if let Err(e) = conn.await {
+        debug!(error = %e, "HTTP port connection ended with error");
     }
 }
 
@@ -552,7 +612,7 @@ fn strip_port(authority: &str) -> &str {
 }
 
 /// Answers a plain-HTTP request on a TLS port with a redirect to `https://`.
-async fn redirect_plain_http(mut stream: TcpStream) -> io::Result<()> {
+async fn redirect_plain_http<S: Io>(mut stream: S) -> io::Result<()> {
     let mut buf = BytesMut::with_capacity(1024);
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 8192 {

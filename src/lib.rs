@@ -11,5 +11,6 @@ pub mod io;
 pub mod portmap;
 pub mod proxy;
 pub mod publicip;
+pub mod relay;
 pub mod server;
 pub mod service;
