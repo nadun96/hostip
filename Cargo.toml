@@ -2,6 +2,9 @@
 name = "hostip"
 version = "0.1.0"
 edition = "2024"
+description = "Publish local apps on your public IP over HTTPS, with Let's Encrypt IP certificates"
+repository = "https://github.com/nadun96/hostip"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -38,3 +41,8 @@ tempfile = "3.27.0"
 
 [target."cfg(windows)".dependencies]
 windows-service = "0.8.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

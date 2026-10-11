@@ -1,0 +1,70 @@
+# Example: a live polling app and a video conferencing app (LiveKit-style SFU)
+# published from a Windows home PC on its public IP.
+#
+#   hostip expose --config hostip.toml               # in a console
+#   hostip service install --config hostip.toml      # as a Windows service (Administrator)
+
+[server]
+# bind = "0.0.0.0"
+# Local port for plain HTTP; the router maps public port 80 to it
+# (Let's Encrypt HTTP-01 validation and http -> https redirects). 0 disables it.
+http_listen = 80
+access_log = false
+
+[network]
+# public_ip = "203.0.113.7"     # detected (and re-checked) automatically when omitted
+ip_check_interval = "60s"
+upnp = true                     # open router ports via UPnP / PCP / NAT-PMP
+# Hand the current public IP to the media server, which must announce it:
+ip_file = 'C:\hostip\public_ip.txt'
+on_ip_change = 'C:\hostip\restart-sfu.cmd'   # gets HOSTIP_PUBLIC_IP, HOSTIP_PREVIOUS_IP
+
+[acme]
+enabled = true                  # Let's Encrypt certificate for the bare public IP
+staging = false                 # set true while testing (untrusted, no rate limits)
+# email = "you@example.com"
+
+[tls]
+# dir = 'C:\ProgramData\hostip\certs'
+
+# Optional: copy the trusted certificate for a TURN-over-TLS server.
+# [tls.export]
+# cert = 'C:\hostip\turn\cert.pem'
+# key = 'C:\hostip\turn\key.pem'
+# on_renew = 'C:\hostip\reload-turn.cmd'
+
+[limits]
+max_connections_per_ip = 256
+new_connections_per_ip_per_minute = 1200
+auth_failures_before_block = 10
+block_minutes = 15
+
+# Polling app: https://<public-ip>/  (public port 443 also lets Let's Encrypt validate)
+[[port]]
+local = 3000
+public = 443
+idle_timeout = "30m"
+# auth = { user = "host", password_hash = "$argon2id$..." }   # hostip hash-password
+
+# Conferencing web UI + signaling (WebSocket): https://<public-ip>:8443
+[[port]]
+local = 7880
+public = 8443
+idle_timeout = "2h"
+max_connections = 150
+
+# Conferencing media (WebRTC UDP): routed by the router straight to the SFU.
+[[port]]
+local = "50000-50100"
+mode = "udp"
+
+# TURN for participants behind strict firewalls.
+[[port]]
+local = 3478
+mode = "udp"
+
+# Publish through a relay instead of opening router ports (see `hostip relay`):
+# [relay]
+# address = "203.0.113.50:7000"
+# token = "..."
+# fingerprint = "..."

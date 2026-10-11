@@ -515,3 +515,12 @@ async fn caps_simultaneous_connections_per_port() {
     third.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"c");
 }
+
+#[test]
+fn example_config_is_valid() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/hostip.toml");
+    let file = hostip::config::FileConfig::load(std::path::Path::new(path)).unwrap();
+    let specs = file.port_specs().unwrap();
+    hostip::config::validate_specs(&specs).unwrap();
+    assert_eq!(specs.len(), 4);
+}

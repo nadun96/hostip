@@ -49,7 +49,9 @@ Milestones **M1** and **M1.5** are done:
   access): a small `hostip relay` on any server with a public IP; your PC dials
   out to it, TLS still terminates on your PC, UDP media is relayed too
 
-Not done yet: release packaging.
+Releases are built for Windows, Linux and macOS by `.github/workflows/release.yml`
+when a `v*` tag is pushed. A documented example config for a polling app plus a
+video conferencing server is in [`examples/hostip.toml`](examples/hostip.toml).
 
 ## Usage
 
@@ -231,6 +233,12 @@ auth = { user = "alice", password_hash = "$argon2id$v=19$..." }
 local = "50000-60000"
 mode = "udp"
 ```
+
+## Download
+
+Pre-built binaries for Windows, Linux (x86_64, arm64) and macOS are attached to
+each [GitHub release](https://github.com/nadun96/hostip/releases), together with
+`examples/hostip.toml` and SHA-256 checksums.
 
 ## Building
 
