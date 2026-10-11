@@ -27,7 +27,7 @@ use tokio::sync::{OnceCell, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::cert::{self, CertStore};
+use crate::cert::{self, CertStore, PemPair};
 
 pub const LETS_ENCRYPT_PRODUCTION: &str = "https://acme-v02.api.letsencrypt.org/directory";
 pub const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
@@ -118,6 +118,7 @@ impl HttpChallenges {
 /// An issued certificate and its validity window.
 pub struct Issued {
     pub key: CertifiedKey,
+    pub pem: PemPair,
     pub not_before: OffsetDateTime,
     pub not_after: OffsetDateTime,
 }
@@ -130,6 +131,10 @@ impl Issued {
             .map_err(|e| anyhow!("invalid certificate: {e}"))?;
         let validity = parsed.validity();
         Ok(Self {
+            pem: PemPair {
+                chain: chain_pem.to_owned(),
+                key: key_pem.to_owned(),
+            },
             not_before: OffsetDateTime::from_unix_timestamp(validity.not_before.timestamp())?,
             not_after: OffsetDateTime::from_unix_timestamp(validity.not_after.timestamp())?,
             key,
@@ -234,7 +239,7 @@ impl AcmeManager {
             && stored.renew_at(self.opts.renew_before) > now
         {
             let renew_at = stored.renew_at(self.opts.renew_before);
-            self.certs.replace(stored.key);
+            self.certs.replace_with_pem(stored.key, stored.pem);
             return Ok(renew_at);
         }
         let issued = self.issue(ip).await?;
@@ -243,7 +248,7 @@ impl AcmeManager {
             issued.not_after
         );
         let renew_at = issued.renew_at(self.opts.renew_before);
-        self.certs.replace(issued.key);
+        self.certs.replace_with_pem(issued.key, issued.pem);
         Ok(renew_at)
     }
 
@@ -509,6 +514,10 @@ mod tests {
         let not_before = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let issued = Issued {
             key: tls_alpn_certificate("203.0.113.7".parse().unwrap(), &[0; 32]).unwrap(),
+            pem: PemPair {
+                chain: String::new(),
+                key: String::new(),
+            },
             not_before,
             not_after: not_before + time::Duration::days(6),
         };

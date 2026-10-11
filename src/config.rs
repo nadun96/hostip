@@ -268,6 +268,17 @@ pub struct TlsSection {
     pub dir: Option<PathBuf>,
     #[serde(default)]
     pub extra_sans: Vec<String>,
+    /// Copy the served certificate to these files for other programs (e.g. a TURN server).
+    pub export: Option<ExportSection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportSection {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    /// Command run after each export; gets HOSTIP_CERT_FILE and HOSTIP_KEY_FILE.
+    pub on_renew: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -281,6 +292,10 @@ pub struct NetworkSection {
     pub ip_check_interval: Option<String>,
     /// Open router ports automatically via UPnP / PCP / NAT-PMP (default true).
     pub upnp: Option<bool>,
+    /// File that always holds the current public IP.
+    pub ip_file: Option<PathBuf>,
+    /// Command run at start and on every IP change; gets HOSTIP_PUBLIC_IP and HOSTIP_PREVIOUS_IP.
+    pub on_ip_change: Option<String>,
 }
 
 /// Let's Encrypt settings for the bare-IP certificate.
@@ -483,6 +498,13 @@ mod tests {
             [network]
             public_ip = "203.0.113.7"
             ip_check_interval = "60s"
+
+            ip_file = "public_ip.txt"
+            on_ip_change = "restart-sfu.cmd"
+
+            [tls.export]
+            cert = "turn/cert.pem"
+            key = "turn/key.pem"
 
             [acme]
             staging = true

@@ -18,6 +18,7 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
+use tokio::sync::watch;
 
 const CERT_FILE: &str = "self-signed.pem";
 const KEY_FILE: &str = "self-signed.key";
@@ -40,7 +41,17 @@ pub struct CertInfo {
     pub sans: Vec<String>,
     pub not_after: OffsetDateTime,
     pub cert_path: PathBuf,
+    pub key_path: PathBuf,
     pub generated: bool,
+}
+
+impl CertInfo {
+    pub fn read_pem(&self) -> Result<PemPair> {
+        Ok(PemPair {
+            chain: std::fs::read_to_string(&self.cert_path)?,
+            key: std::fs::read_to_string(&self.key_path)?,
+        })
+    }
 }
 
 impl fmt::Display for CertInfo {
@@ -62,20 +73,50 @@ pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 #[derive(Debug)]
 pub struct CertStore {
     current: ArcSwap<CertifiedKey>,
+    /// PEM text of `current`, when known (for exporting it to other programs, F28).
+    current_pem: ArcSwapOption<PemPair>,
     /// Answer for a pending TLS-ALPN-01 challenge, if any.
     acme_challenge: ArcSwapOption<CertifiedKey>,
+    /// Bumped on every replacement.
+    changes: watch::Sender<u64>,
+}
+
+/// A certificate chain and its private key as PEM text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PemPair {
+    pub chain: String,
+    pub key: String,
 }
 
 impl CertStore {
     pub fn new(key: CertifiedKey) -> Arc<Self> {
         Arc::new(Self {
             current: ArcSwap::from_pointee(key),
+            current_pem: ArcSwapOption::empty(),
             acme_challenge: ArcSwapOption::empty(),
+            changes: watch::Sender::new(0),
         })
     }
 
     pub fn replace(&self, key: CertifiedKey) {
         self.current.store(Arc::new(key));
+        self.current_pem.store(None);
+        self.changes.send_modify(|n| *n += 1);
+    }
+
+    pub fn replace_with_pem(&self, key: CertifiedKey, pem: PemPair) {
+        self.current.store(Arc::new(key));
+        self.current_pem.store(Some(Arc::new(pem)));
+        self.changes.send_modify(|n| *n += 1);
+    }
+
+    pub fn current_pem(&self) -> Option<Arc<PemPair>> {
+        self.current_pem.load_full()
+    }
+
+    /// Notifies on every certificate replacement.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     pub fn current(&self) -> Arc<CertifiedKey> {
@@ -115,6 +156,7 @@ pub fn load_or_generate(dir: &Path, sans: &[String]) -> Result<(CertifiedKey, Ce
             sans: meta.sans.into_iter().collect(),
             not_after: OffsetDateTime::from_unix_timestamp(meta.not_after)?,
             cert_path,
+            key_path,
             generated: false,
         };
         return Ok((key, info));
@@ -135,6 +177,7 @@ pub fn load_or_generate(dir: &Path, sans: &[String]) -> Result<(CertifiedKey, Ce
         sans: wanted.into_iter().collect(),
         not_after,
         cert_path,
+        key_path,
         generated: true,
     };
     Ok((key, info))
@@ -147,6 +190,7 @@ pub fn stored_info(dir: &Path) -> Option<CertInfo> {
         sans: meta.sans.into_iter().collect(),
         not_after: OffsetDateTime::from_unix_timestamp(meta.not_after).ok()?,
         cert_path: dir.join(CERT_FILE),
+        key_path: dir.join(KEY_FILE),
         generated: false,
     })
 }

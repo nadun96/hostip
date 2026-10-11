@@ -14,6 +14,7 @@ use hostip::access::{self, AuthConfig, Guard};
 use hostip::acme::{self, AcmeManager, AcmeOptions, ChallengeKind, HttpChallenges};
 use hostip::cert::{self, CertStore};
 use hostip::config::{FileConfig, Mode, PortRange, PortSpec, parse_duration, validate_specs};
+use hostip::hooks::{self, CertExport, IpHooks};
 use hostip::portmap::{self, DiscoverOptions};
 use hostip::publicip;
 use hostip::server::{self, Server, ServerOptions};
@@ -96,6 +97,22 @@ struct ExposeArgs {
     /// Log every HTTP request.
     #[arg(long)]
     access_log: bool,
+    /// Keep the current public IP in this file.
+    #[arg(long)]
+    ip_file: Option<PathBuf>,
+    /// Run this command at start and whenever the public IP changes
+    /// (gets HOSTIP_PUBLIC_IP and HOSTIP_PREVIOUS_IP).
+    #[arg(long)]
+    on_ip_change: Option<String>,
+    /// Copy the served certificate chain to this file (needs --export-key).
+    #[arg(long, requires = "export_key")]
+    export_cert: Option<PathBuf>,
+    /// Copy the certificate's private key to this file.
+    #[arg(long, requires = "export_cert")]
+    export_key: Option<PathBuf>,
+    /// Run this command after each certificate export (gets HOSTIP_CERT_FILE, HOSTIP_KEY_FILE).
+    #[arg(long)]
+    on_cert_renew: Option<String>,
 }
 
 #[tokio::main]
@@ -228,7 +245,10 @@ async fn expose(args: ExposeArgs) -> Result<()> {
             "using "
         }
     );
-    let certs = CertStore::new(key);
+    let certs = CertStore::new(key.clone());
+    if let Ok(pem) = info.read_pem() {
+        certs.replace_with_pem(key, pem);
+    }
 
     let bind = args
         .bind
@@ -346,13 +366,40 @@ async fn expose(args: ExposeArgs) -> Result<()> {
         manager.set_fallback(Box::new(move |ip| Ok(fallback(Some(ip))?.0)));
         tokio::spawn(manager.run(ip_rx.clone(), shutdown.clone()));
     }
+    let ip_hooks = IpHooks {
+        ip_file: args.ip_file.clone().or(file.network.ip_file.clone()),
+        on_change: args
+            .on_ip_change
+            .clone()
+            .or(file.network.on_ip_change.clone()),
+    };
+    if ip_hooks.ip_file.is_some() || ip_hooks.on_change.is_some() {
+        tokio::spawn(hooks::watch_ip(ip_rx.clone(), ip_hooks));
+    }
+    let export = match (&args.export_cert, &args.export_key) {
+        (Some(cert), Some(key)) => Some(CertExport {
+            cert: cert.clone(),
+            key: key.clone(),
+            on_renew: args.on_cert_renew.clone(),
+        }),
+        _ => file.tls.export.clone().map(|e| CertExport {
+            cert: e.cert,
+            key: e.key,
+            on_renew: args.on_cert_renew.clone().or(e.on_renew),
+        }),
+    };
+    if let Some(export) = export {
+        tokio::spawn(hooks::export_certs(certs.clone(), export));
+    }
     tokio::spawn(report_ip_changes(
         ip_rx,
         specs.clone(),
         (!acme_active).then(|| {
             let certs = certs.clone();
-            move |ip| match self_signed(Some(ip)) {
-                Ok((key, _)) => certs.replace(key),
+            move |ip| match self_signed(Some(ip))
+                .and_then(|(key, info)| Ok((key, info.read_pem()?)))
+            {
+                Ok((key, pem)) => certs.replace_with_pem(key, pem),
                 Err(e) => warn!("cannot regenerate the self-signed certificate: {e:#}"),
             }
         }),

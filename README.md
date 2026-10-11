@@ -35,8 +35,12 @@ Milestones **M1** and **M1.5** are done:
   password hashes) with brute-force blocking, IP allow/deny lists, per-port
   connection caps, per-IP connection and rate limits, access log
 
-Not done yet: Windows service and firewall setup, IP-change hooks for media
-servers, relay mode.
+- **Hand-off to other programs**: the current public IP in a file plus an
+  `on_ip_change` command (e.g. restart a WebRTC media server so it announces
+  the new IP), and the served certificate exported as PEM with an
+  `on_cert_renew` command (e.g. reload a TURN-over-TLS server)
+
+Not done yet: Windows service and firewall setup, relay mode.
 
 ## Usage
 
@@ -44,6 +48,8 @@ servers, relay mode.
 hostip expose [PORTS]... [--config hostip.toml] [--public-ip IP] [--bind ADDR] [--cert-dir DIR]
               [--no-acme] [--acme-staging] [--acme-email EMAIL] [--http-listen PORT] [--no-upnp]
               [--auth USER:PASSWORD] [--allow CIDR]... [--max-connections N] [--access-log]
+              [--ip-file FILE] [--on-ip-change CMD] [--export-cert FILE --export-key FILE]
+              [--on-cert-renew CMD]
 hostip hash-password   # reads a password on stdin, prints an Argon2 hash for the config
 hostip ip      # show the public and LAN IP addresses
 hostip cert    # show the stored certificate
@@ -92,6 +98,24 @@ connections a minute, generous because many participants can share one
 address) and can be restricted with `allow`/`deny` lists or a
 `max_connections` cap.
 
+### Video conferencing (WebRTC) servers
+
+hostip proxies the web UI and signaling; the media server's UDP ports are
+mapped on the router and go straight to it. The media server must announce the
+public IP, which changes on a home connection:
+
+```
+hostip expose 7880:443 udp:50000-50100 \
+  --ip-file C:\hostip\public_ip.txt \
+  --on-ip-change "C:\hostip\restart-sfu.cmd" \
+  --export-cert C:\hostip\turn\cert.pem --export-key C:\hostip\turn\key.pem
+```
+
+The `on_ip_change` command runs at start and after every change with
+`HOSTIP_PUBLIC_IP` and `HOSTIP_PREVIOUS_IP` set; `on_cert_renew` gets
+`HOSTIP_CERT_FILE` and `HOSTIP_KEY_FILE`. Commands run through `cmd /C` on
+Windows and `sh -c` elsewhere.
+
 ### Router port forwarding
 
 hostip opens the needed router ports itself via UPnP (or PCP / NAT-PMP) unless
@@ -115,6 +139,13 @@ UDP 50000-60000 -> 192.168.1.10:50000-60000
 public_ip = "203.0.113.7"      # optional; detected (and re-checked) automatically otherwise
 ip_check_interval = "60s"
 upnp = true                    # default
+ip_file = 'C:\hostip\public_ip.txt'
+on_ip_change = 'C:\hostip\restart-sfu.cmd'
+
+[tls.export]
+cert = 'C:\hostip\turn\cert.pem'
+key = 'C:\hostip\turn\key.pem'
+on_renew = 'C:\hostip\reload-turn.cmd'
 
 [acme]
 enabled = true                 # default
