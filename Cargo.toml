@@ -22,6 +22,7 @@ igd-next = { version = "0.18.0", default-features = false, features = ["aio_toki
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen", "time"] }
 ipnet = { version = "2.12.2", features = ["serde"] }
 netdev = "0.46.3"
+qrcode = { version = "0.14.1", default-features = false }
 rcgen = "0.14.10"
 ring = "0.17.14"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }

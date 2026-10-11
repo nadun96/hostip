@@ -13,9 +13,14 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode, Uri, Version};
+use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use tracing::{debug, info, warn};
 
 use crate::access::{AuthOutcome, BasicAuth, Guard};
@@ -54,8 +59,10 @@ enum Denied {
 }
 
 pub struct HttpProxy {
-    client: Client<HttpConnector, Incoming>,
+    client: Client<HttpsConnector<HttpConnector>, Incoming>,
     upstream: SocketAddr,
+    /// `http` or `https`, depending on what the app itself speaks.
+    upstream_scheme: &'static str,
     /// Used for redirects when the client sent no Host header.
     fallback_authority: String,
     auth: Option<Arc<BasicAuth>>,
@@ -70,16 +77,24 @@ impl HttpProxy {
         auth: Option<Arc<BasicAuth>>,
         guard: Arc<Guard>,
         access_log: bool,
+        upstream_tls: bool,
     ) -> Arc<Self> {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         connector.set_connect_timeout(Some(Duration::from_secs(5)));
+        connector.enforce_http(false);
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(loopback_tls_config())
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(connector);
         let client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(90))
             .build(connector);
         Arc::new(Self {
             client,
             upstream,
+            upstream_scheme: if upstream_tls { "https" } else { "http" },
             fallback_authority,
             auth,
             guard,
@@ -174,15 +189,16 @@ impl HttpProxy {
 
         let (mut parts, body) = req.into_parts();
         let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-        parts.uri = match format!("http://{}{}", self.upstream, path).parse::<Uri>() {
-            Ok(uri) => uri,
-            Err(_) => {
-                return Ok(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid request target",
-                ));
-            }
-        };
+        parts.uri =
+            match format!("{}://{}{}", self.upstream_scheme, self.upstream, path).parse::<Uri>() {
+                Ok(uri) => uri,
+                Err(_) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid request target",
+                    ));
+                }
+            };
         parts.version = Version::HTTP_11;
         strip_hop_by_hop(&mut parts.headers);
         if let Some(protocol) = &upgrade {
@@ -248,6 +264,68 @@ impl HttpProxy {
         }
 
         Ok(resp.map(|b| b.boxed()))
+    }
+}
+
+/// TLS settings for talking to the app on this machine. Apps serving HTTPS locally
+/// almost always use a self-signed certificate, and the connection never leaves
+/// the machine (the upstream is always 127.0.0.1), so the certificate is not
+/// checked; handshake signatures still are.
+fn loopback_tls_config() -> rustls::ClientConfig {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(LoopbackVerifier(provider)))
+        .with_no_client_auth()
+}
+
+#[derive(Debug)]
+struct LoopbackVerifier(Arc<CryptoProvider>);
+
+impl ServerCertVerifier for LoopbackVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 

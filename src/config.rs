@@ -141,6 +141,8 @@ pub struct PortSpec {
     pub idle_timeout: Option<Duration>,
     /// Allow/deny lists, connection cap and login for this port.
     pub access: AccessConfig,
+    /// The app itself serves HTTPS (usually with its own self-signed certificate).
+    pub upstream_tls: bool,
 }
 
 impl PortSpec {
@@ -186,6 +188,7 @@ impl PortSpec {
             listen,
             idle_timeout,
             access: AccessConfig::default(),
+            upstream_tls: false,
         };
         if mode != Mode::Udp && spec.listen.is_none() {
             spec.listen = Some(spec.default_listen_port()?);
@@ -347,6 +350,9 @@ pub struct PortEntry {
     pub max_connections: Option<usize>,
     /// Require a login (HTTP ports only).
     pub auth: Option<AuthConfig>,
+    /// The app serves HTTPS itself; hostip connects to it over TLS (HTTP ports only).
+    #[serde(default)]
+    pub upstream_tls: bool,
 }
 
 /// A port written either as a TOML integer (`3000`) or string (`"50000-60000"`).
@@ -381,6 +387,7 @@ impl PortEntry {
             self.listen,
             idle,
         )?;
+        spec.upstream_tls = self.upstream_tls;
         spec.access = AccessConfig {
             allow: self.allow.clone(),
             deny: self.deny.clone(),
@@ -436,6 +443,12 @@ pub fn validate_specs(specs: &[PortSpec]) -> Result<()> {
         }
         if a.access.auth.is_some() && !matches!(a.mode, Mode::Auto | Mode::Https) {
             bail!("port {}: `auth` needs mode auto or https", a.public);
+        }
+        if a.upstream_tls && !matches!(a.mode, Mode::Auto | Mode::Https) {
+            bail!(
+                "port {}: `upstream_tls` needs mode auto or https (use tcp mode to pass TLS through)",
+                a.public
+            );
         }
         if a.mode == Mode::Udp && a.access != AccessConfig::default() {
             bail!(

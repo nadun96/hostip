@@ -26,7 +26,8 @@ Milestones **M1** and **M1.5** are done:
   other protocol upgrades, `X-Forwarded-*` / `Forwarded` headers, localhost
   redirects rewritten to the public address, plain `http://` redirected to
   `https://`
-- Public IP detection and change tracking, graceful shutdown
+- Public IP detection and change tracking, graceful shutdown, a QR code of the
+  share link in the console, apps that serve HTTPS themselves
 - **Automatic router port mapping**: UPnP-IGD, falling back to PCP / NAT-PMP;
   leases are renewed and removed on exit. Falls back to printed manual
   forwarding rules when the router doesn't cooperate, and warns about double NAT
@@ -93,6 +94,12 @@ accept the Let's Encrypt Subscriber Agreement. Try `--acme-staging` first while
 setting things up; staging certificates are not trusted by browsers but don't
 count against rate limits. Certificates and the ACME account live in
 `<cert-dir>/acme`.
+
+### Apps that serve HTTPS themselves
+
+If an app only listens with TLS (often with its own self-signed certificate),
+set `upstream_tls = true` on its `[[port]]`; hostip then connects to it over
+TLS. Its certificate is not checked, since the connection never leaves this PC.
 
 ### Who can connect
 

@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -800,6 +801,23 @@ fn print_summary(
             s.local,
             s.mode
         );
+    }
+    if std::io::stdout().is_terminal()
+        && let Some(url) = specs
+            .iter()
+            .find(|s| matches!(s.mode, Mode::Auto | Mode::Https))
+            .map(|s| public_url(s, &host))
+        && let Ok(code) = qrcode::QrCode::new(&url)
+    {
+        // Inverted colours read well on dark terminals and still scan on light ones.
+        let qr = code
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .dark_color(qrcode::render::unicode::Dense1x2::Light)
+            .light_color(qrcode::render::unicode::Dense1x2::Dark)
+            .build();
+        println!();
+        println!("Scan to open {url}:");
+        println!("{qr}");
     }
     println!();
     if let Some(relay) = relay {

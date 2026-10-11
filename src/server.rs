@@ -175,6 +175,7 @@ impl Server {
                 rules.auth.clone(),
                 options.guard.clone(),
                 options.access_log,
+                spec.upstream_tls,
             );
             let ctx = PortCtx {
                 spec: spec.clone(),

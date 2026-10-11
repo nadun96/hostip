@@ -524,3 +524,68 @@ fn example_config_is_valid() {
     hostip::config::validate_specs(&specs).unwrap();
     assert_eq!(specs.len(), 4);
 }
+
+/// An app that serves HTTPS itself, with its own self-signed certificate.
+async fn start_https_upstream(dir: &std::path::Path) -> u16 {
+    let (key, _) = cert::load_or_generate(dir, &["localhost".into()]).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_cert_resolver(CertStore::new(key));
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind((LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(|_req: Request<Incoming>| async {
+                    Ok::<_, Infallible>(Response::new(Full::<Bytes>::from("secure upstream")))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(tls), service)
+                    .await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn proxies_to_apps_that_serve_https_themselves() {
+    let app_dir = tempfile::tempdir().unwrap();
+    let up = start_https_upstream(app_dir.path()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (key, info) = cert::load_or_generate(dir.path(), &["127.0.0.1".into()]).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_file_iter(&info.cert_path).unwrap() {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let mut spec = PortSpec::new(Mode::Auto, PortRange::single(up), None, Some(0), None).unwrap();
+    spec.upstream_tls = true;
+    let server = Server::bind(&[spec], LOCALHOST, CertStore::new(key), "127.0.0.1")
+        .await
+        .unwrap();
+    let addr = server.local_addrs()[0].1;
+    let shutdown = CancellationToken::new();
+    tokio::spawn(server.serve(shutdown.clone()));
+    let hostip = Hostip {
+        addr,
+        roots,
+        shutdown,
+        _dir: dir,
+    };
+
+    let mut client = hostip.http1().await;
+    let resp = client.send_request(get("x", "/")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_text(resp).await, "secure upstream");
+}
