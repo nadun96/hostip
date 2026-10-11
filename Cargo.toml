@@ -12,9 +12,11 @@ http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["server", "client", "http1", "http2"] }
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["ring", "webpki-roots", "http1", "tls12"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls", "rcgen", "time"] }
 rcgen = "0.14.10"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 time = "0.3.55"
 tokio = { version = "1.53.2", features = ["full"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
@@ -22,6 +24,7 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 toml = "1.1.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+x509-parser = "0.18.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

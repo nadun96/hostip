@@ -235,6 +235,8 @@ pub struct FileConfig {
     pub tls: TlsSection,
     #[serde(default)]
     pub network: NetworkSection,
+    #[serde(default)]
+    pub acme: AcmeSection,
     #[serde(default, rename = "port")]
     pub ports: Vec<PortEntry>,
 }
@@ -244,6 +246,9 @@ pub struct FileConfig {
 pub struct ServerSection {
     /// Address to bind listeners on (default `0.0.0.0`).
     pub bind: Option<IpAddr>,
+    /// Local port for the plain-HTTP listener the router maps public port 80 to
+    /// (ACME HTTP-01 and redirects). Default 80; 0 disables it.
+    pub http_listen: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -261,6 +266,27 @@ pub struct NetworkSection {
     pub public_ip: Option<IpAddr>,
     #[serde(default)]
     pub public_ip_sources: Vec<String>,
+    /// How often to re-check the public IP, e.g. `60s`.
+    pub ip_check_interval: Option<String>,
+}
+
+/// Let's Encrypt settings for the bare-IP certificate.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeSection {
+    /// Default true.
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub staging: bool,
+    /// Custom ACME directory URL (overrides `staging`).
+    pub directory: Option<String>,
+    pub email: Option<String>,
+    /// Default `shortlived` (required by Let's Encrypt for IP certificates).
+    pub profile: Option<String>,
+    /// Extra root CA for the ACME server's own HTTPS (test CAs only).
+    pub ca_root: Option<PathBuf>,
+    /// Renew this long before expiry, e.g. `2d`; default one third of the lifetime.
+    pub renew_before: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -417,6 +443,11 @@ mod tests {
             r#"
             [network]
             public_ip = "203.0.113.7"
+            ip_check_interval = "60s"
+
+            [acme]
+            staging = true
+            email = "me@example.com"
 
             [[port]]
             local = 3000

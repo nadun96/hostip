@@ -8,6 +8,9 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Limited};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
 
 pub const DEFAULT_SOURCES: &[&str] = &[
     "https://api.ipify.org",
@@ -53,6 +56,38 @@ where
     let text = std::str::from_utf8(&body)?.trim();
     text.parse()
         .with_context(|| format!("not an IP address: `{text}`"))
+}
+
+/// Re-checks the public IP every `interval` and publishes changes (F7, F19).
+pub async fn watch(
+    sources: Vec<String>,
+    interval: Duration,
+    tx: watch::Sender<Option<IpAddr>>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        match detect(&sources).await {
+            Ok(ip) => {
+                tx.send_if_modified(|current| {
+                    if *current == Some(ip) {
+                        return false;
+                    }
+                    info!(
+                        "public IP changed: {} -> {ip}",
+                        current.map_or("none".into(), |c| c.to_string())
+                    );
+                    *current = Some(ip);
+                    true
+                });
+            }
+            // Transient: keep the last known IP.
+            Err(e) => debug!("public IP check failed: {e:#}"),
+        }
+    }
 }
 
 /// The address this machine uses on the LAN (no packets are sent).

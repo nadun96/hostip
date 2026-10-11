@@ -1,5 +1,6 @@
 //! TCP listeners: TLS termination, protocol sniffing and dispatch (F1, F16, F30, F31).
 
+use std::convert::Infallible;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -8,7 +9,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::header::{self, HeaderValue};
 use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use rustls::ServerConfig;
@@ -20,7 +25,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
-use crate::cert::CertStore;
+use crate::acme::HttpChallenges;
+use crate::cert::{ACME_TLS_ALPN, CertStore};
 use crate::config::{Mode, PortSpec};
 use crate::io::{Activity, Prefixed};
 use crate::proxy::HttpProxy;
@@ -54,8 +60,15 @@ struct PortCtx {
     tls_raw: TlsAcceptor,
 }
 
+struct HttpPortCtx {
+    challenges: Arc<HttpChallenges>,
+    /// Public HTTPS port that plain-HTTP visitors are redirected to.
+    https_port: Option<u16>,
+}
+
 pub struct Server {
     listeners: Vec<(Arc<PortCtx>, TcpListener)>,
+    http_port: Option<(Arc<HttpPortCtx>, TcpListener)>,
 }
 
 impl Server {
@@ -91,7 +104,31 @@ impl Server {
             };
             listeners.push((Arc::new(ctx), listener));
         }
-        Ok(Self { listeners })
+        Ok(Self {
+            listeners,
+            http_port: None,
+        })
+    }
+
+    /// Adds the plain-HTTP listener (public port 80): answers ACME HTTP-01 challenges and
+    /// redirects everything else to `https://` on `https_port`.
+    pub async fn bind_http(
+        &mut self,
+        bind: IpAddr,
+        port: u16,
+        challenges: Arc<HttpChallenges>,
+        https_port: Option<u16>,
+    ) -> Result<SocketAddr> {
+        let listener = TcpListener::bind((bind, port))
+            .await
+            .with_context(|| format!("cannot listen on {bind}:{port} for HTTP"))?;
+        let addr = listener.local_addr()?;
+        let ctx = HttpPortCtx {
+            challenges,
+            https_port,
+        };
+        self.http_port = Some((Arc::new(ctx), listener));
+        Ok(addr)
     }
 
     /// The actual bound address of each listener, in spec order.
@@ -113,6 +150,14 @@ impl Server {
                 shutdown.clone(),
             ));
         }
+        if let Some((ctx, listener)) = self.http_port {
+            tracker.spawn(http_port_loop(
+                ctx,
+                listener,
+                tracker.clone(),
+                shutdown.clone(),
+            ));
+        }
         shutdown.cancelled().await;
         tracker.close();
         if timeout(SHUTDOWN_GRACE, tracker.wait()).await.is_err() {
@@ -128,7 +173,7 @@ fn tls_config(certs: Arc<CertStore>, http_alpn: bool) -> Result<Arc<ServerConfig
             .with_no_client_auth()
             .with_cert_resolver(certs);
     if http_alpn {
-        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), ACME_TLS_ALPN.to_vec()];
     }
     Ok(Arc::new(cfg))
 }
@@ -213,12 +258,16 @@ async fn handle_tls(
         Err(_) => return Ok(()),
     };
 
+    let alpn = tls.get_ref().1.alpn_protocol();
+    if alpn == Some(ACME_TLS_ALPN) {
+        // TLS-ALPN-01 validation: the handshake itself is the answer (RFC 8737).
+        return Ok(());
+    }
+
     match ctx.spec.mode {
         Mode::Tls => pipe(ctx, tls, Bytes::new(), shutdown).await,
         Mode::Https => serve_http(ctx, tls, peer, shutdown).await,
-        _ if tls.get_ref().1.alpn_protocol() == Some(b"h2") => {
-            serve_http(ctx, tls, peer, shutdown).await
-        }
+        _ if alpn == Some(b"h2") => serve_http(ctx, tls, peer, shutdown).await,
         _ => {
             let (prefix, is_http) = sniff(&mut tls).await?;
             if is_http {
@@ -330,6 +379,95 @@ where
     }
 }
 
+async fn http_port_loop(
+    ctx: Arc<HttpPortCtx>,
+    listener: TcpListener,
+    tracker: TaskTracker,
+    shutdown: CancellationToken,
+) {
+    loop {
+        let stream = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    warn!(error = %e, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+        let ctx = ctx.clone();
+        tracker.spawn(async move {
+            let service = service_fn(move |req| http_port_response(req, ctx.clone()));
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_READ_TIMEOUT)
+                .serve_connection(TokioIo::new(stream), service);
+            if let Err(e) = conn.await {
+                debug!(error = %e, "HTTP port connection ended with error");
+            }
+        });
+    }
+}
+
+async fn http_port_response(
+    req: Request<Incoming>,
+    ctx: Arc<HttpPortCtx>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let text = |status: StatusCode, body: String| {
+        let mut resp = Response::new(Full::from(body));
+        *resp.status_mut() = status;
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        resp
+    };
+    if let Some(token) = req
+        .uri()
+        .path()
+        .strip_prefix("/.well-known/acme-challenge/")
+    {
+        return Ok(match ctx.challenges.get(token) {
+            Some(key_authorization) => text(StatusCode::OK, key_authorization),
+            None => text(StatusCode::NOT_FOUND, "unknown challenge\n".into()),
+        });
+    }
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(strip_port);
+    let target = match (ctx.https_port, host) {
+        (Some(443), Some(host)) => format!("https://{host}"),
+        (Some(port), Some(host)) => format!("https://{host}:{port}"),
+        _ => {
+            return Ok(text(
+                StatusCode::NOT_FOUND,
+                "hostip: nothing is published over HTTPS on port 443\n".into(),
+            ));
+        }
+    };
+    let path = req.uri().path_and_query().map_or("/", |p| p.as_str());
+    let mut resp = text(StatusCode::PERMANENT_REDIRECT, String::new());
+    if let Ok(location) = HeaderValue::from_str(&format!("{target}{path}")) {
+        resp.headers_mut().insert(header::LOCATION, location);
+    }
+    Ok(resp)
+}
+
+/// `host:port` -> `host`, keeping IPv6 brackets.
+fn strip_port(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        authority
+            .find(']')
+            .map_or(authority, |end| &authority[..=end])
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    }
+}
+
 /// Answers a plain-HTTP request on a TLS port with a redirect to `https://`.
 async fn redirect_plain_http(mut stream: TcpStream) -> io::Result<()> {
     let mut buf = BytesMut::with_capacity(1024);
@@ -387,6 +525,13 @@ mod tests {
         assert_eq!(classify(b"P"), None);
         assert_eq!(classify(b"\x00\x01binary"), Some(false));
         assert_eq!(classify(b"GETX"), Some(false));
+    }
+
+    #[test]
+    fn strips_ports_from_hosts() {
+        assert_eq!(strip_port("203.0.113.7:80"), "203.0.113.7");
+        assert_eq!(strip_port("203.0.113.7"), "203.0.113.7");
+        assert_eq!(strip_port("[2001:db8::1]:80"), "[2001:db8::1]");
     }
 
     #[test]
