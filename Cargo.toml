@@ -1,0 +1,27 @@
+[package]
+name = "hostip"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+arc-swap = "1.9.2"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive"] }
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server", "client", "http1", "http2"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["ring", "webpki-roots", "http1", "tls12"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1", "http2"] }
+rcgen = "0.14.10"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+time = "0.3.55"
+tokio = { version = "1.53.2", features = ["full"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
