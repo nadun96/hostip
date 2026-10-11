@@ -520,3 +520,42 @@ protocol = "udp"
 
 **Open**
 - None blocking. Requirements are ready for implementation (M1).
+
+---
+
+## 10. Implementation status (`dev` branch)
+
+✅ done · 🟡 partial · ⬜ not yet
+
+| ID | Status | Where / notes |
+|----|--------|---------------|
+| F1 | ✅ | Listeners per port; any public port incl. 443 (`src/server.rs`) |
+| F2, F8, F11, F20–F22, F25, F33 | ✅ | `src/proxy.rs`: streamed bodies, upgrades (WebSocket), forwarded headers, redirect rewrite, no total timeout; tests in `tests/proxy.rs` |
+| F3, F30, F31, F34 | ✅ | Stack-agnostic port specs and modes (`src/config.rs`), HTTP sniffing in `auto` |
+| F4 | ✅ | Self-signed fallback with public/LAN IP SANs (`src/cert.rs`) |
+| F5 | ⬜ | Local CA mode — superseded in practice by Let's Encrypt IP certificates |
+| F6 | ⬜ | User-supplied certificate files |
+| F7, F19 | ✅ | IP watcher with confirmation and address-family stickiness; re-issue on change (`src/publicip.rs`, `src/acme.rs`) |
+| F9 | ✅ | HTTP/2 via ALPN |
+| F10 | ✅ | Port-80 listener: ACME HTTP-01 + redirect to https |
+| F12, F26 | ✅ | UPnP-IGD with PCP/NAT-PMP fallback, leases renewed, removed on exit (`src/portmap.rs`; fake-router tests) |
+| F13, F29 | 🟡 | Double-NAT/CGNAT warning from the router's WAN address; Let's Encrypt validation proves 443/80 reachability. No independent outside probe yet |
+| F14 | 🟡 | `expose`, `ip`, `cert`, `hash-password`, `service`, `relay`; no `status` command |
+| F15 | ⬜ | Hot reload of the config file |
+| F16 | ✅ | Graceful shutdown with drain (Ctrl+C, SIGTERM, service stop) |
+| F17 | ✅ | Let's Encrypt bare-IP certificates, short-lived profile, TLS-ALPN-01 + HTTP-01 with rotation, renewal at ⅔ lifetime (`src/acme.rs`; Pebble tests) |
+| F18 | ✅ | Share links and a terminal QR code |
+| F23 | 🟡 | Per-port connection cap; per-client bandwidth cap not yet |
+| F24 | ✅ | Bodies are never compressed or rewritten |
+| F27, F28 | ✅ | IP file + `on_ip_change`; certificate export + `on_cert_renew` (`src/hooks.rs`) |
+| F32 | ✅ | `upstream_tls` for apps that serve HTTPS themselves |
+| F35, F36 | ✅ | Connectivity ladder: already reachable → UPnP → PCP/NAT-PMP → relay mode (`src/relay.rs`; end-to-end tests incl. UDP). IPv6-only path not specially handled |
+| S1 | ✅ | Upstreams are always 127.0.0.1 |
+| S2 | ✅ | rustls safe defaults (TLS 1.2/1.3) |
+| S3 | 🟡 | Basic auth + session cookie, Argon2; **opt-in** (`--auth`), not on by default — public conferencing links must work without a password prompt; the startup summary warns about open ports |
+| S4, S5, S8 | ✅ | `src/access.rs`: allow/deny, per-IP connection/rate limits, brute-force blocking, access log |
+| S6 | ✅ | Private keys 0600 on Unix; Windows data folder ACL set by the service installer |
+| S7 | ✅ | Hop-by-hop headers stripped; generic 502 text |
+| S9 | ✅ | Windows service as LocalService by default; systemd unit with only CAP_NET_BIND_SERVICE |
+| Windows | ✅ | Service, firewall rules, CI on windows-latest, Wine-based local testing |
+| Distribution | ✅ | Release workflow for Windows/Linux/macOS binaries |
