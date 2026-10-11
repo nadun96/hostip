@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 use hostip::acme::{self, AcmeManager, AcmeOptions, ChallengeKind, HttpChallenges};
 use hostip::cert::{self, CertStore};
 use hostip::config::{FileConfig, Mode, PortRange, PortSpec, parse_duration, validate_specs};
+use hostip::portmap::{self, DiscoverOptions};
 use hostip::publicip;
 use hostip::server::{self, Server};
 
@@ -77,6 +78,9 @@ struct ExposeArgs {
     /// Local port for plain HTTP; the router maps public port 80 to it. 0 disables. [default: 80]
     #[arg(long)]
     http_listen: Option<u16>,
+    /// Don't open router ports automatically (UPnP / PCP / NAT-PMP).
+    #[arg(long)]
+    no_upnp: bool,
 }
 
 #[tokio::main]
@@ -241,7 +245,8 @@ async fn expose(args: ExposeArgs) -> Result<()> {
     }
 
     server::log_ready(&server.local_addrs());
-    print_summary(&specs, &host, lan_ip, http_bound, acme_active);
+    let upnp = !args.no_upnp && file.network.upnp.unwrap_or(true);
+    print_summary(&specs, &host, lan_ip, http_bound, acme_active, upnp);
 
     let shutdown = CancellationToken::new();
     tokio::spawn(wait_for_signal(shutdown.clone()));
@@ -310,7 +315,30 @@ async fn expose(args: ExposeArgs) -> Result<()> {
         }),
     ));
 
+    // Router port mapping (F12, F26): opened now, renewed, removed on shutdown.
+    let portmap_task = match lan_ip {
+        Some(IpAddr::V4(lan)) if upnp => {
+            let (mappings, too_large) = portmap::plan(&specs, http_bound);
+            for spec in too_large {
+                warn!(
+                    "UDP {} is too large to map automatically; forward it manually",
+                    spec.public
+                );
+            }
+            Some(tokio::spawn(portmap::run(
+                lan,
+                mappings,
+                DiscoverOptions::default(),
+                shutdown.clone(),
+            )))
+        }
+        _ => None,
+    };
+
     server.serve(shutdown).await;
+    if let Some(task) = portmap_task {
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
     info!("stopped");
     Ok(())
 }
@@ -369,6 +397,7 @@ fn print_summary(
     lan_ip: Option<IpAddr>,
     http_listen: Option<u16>,
     acme: bool,
+    upnp: bool,
 ) {
     let host = url_host(host);
     let pc = lan_ip.map_or_else(|| "this PC".to_owned(), |ip| ip.to_string());
@@ -383,7 +412,14 @@ fn print_summary(
         );
     }
     println!();
-    println!("Router port forwarding needed (automatic UPnP mapping is not implemented yet):");
+    if upnp {
+        println!(
+            "Router ports (opened automatically via UPnP / PCP / NAT-PMP if the router allows it,"
+        );
+        println!("otherwise forward them manually):");
+    } else {
+        println!("Router port forwarding needed:");
+    }
     for s in specs {
         let (proto, target) = match s.listen {
             Some(listen) => ("TCP", listen.to_string()),

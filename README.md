@@ -27,15 +27,17 @@ Milestones **M1** and **M1.5** are done:
   redirects rewritten to the public address, plain `http://` redirected to
   `https://`
 - Public IP detection and change tracking, graceful shutdown
+- **Automatic router port mapping**: UPnP-IGD, falling back to PCP / NAT-PMP;
+  leases are renewed and removed on exit. Falls back to printed manual
+  forwarding rules when the router doesn't cooperate, and warns about double NAT
 
-Not done yet: UPnP port mapping, authentication and rate limits, Windows
-service, relay mode.
+Not done yet: authentication and rate limits, Windows service, relay mode.
 
 ## Usage
 
 ```
 hostip expose [PORTS]... [--config hostip.toml] [--public-ip IP] [--bind ADDR] [--cert-dir DIR]
-              [--no-acme] [--acme-staging] [--acme-email EMAIL] [--http-listen PORT]
+              [--no-acme] [--acme-staging] [--acme-email EMAIL] [--http-listen PORT] [--no-upnp]
 hostip ip      # show the public and LAN IP addresses
 hostip cert    # show the stored certificate
 ```
@@ -67,9 +69,14 @@ count against rate limits. Certificates and the ACME account live in
 
 ### Router port forwarding
 
+hostip opens the needed router ports itself via UPnP (or PCP / NAT-PMP) unless
+`--no-upnp` is given. UDP ranges larger than 128 ports are not mapped
+automatically; prefer a small range or a single UDP port for media servers that
+support it.
+
 hostip can't listen on the app's own port, so when the public port equals the
 local port it listens on `local + 10000`. The startup summary prints exactly
-what to forward, for example:
+what to forward if you do it by hand, for example:
 
 ```
 TCP 3000 -> 192.168.1.10:13000
@@ -82,6 +89,7 @@ UDP 50000-60000 -> 192.168.1.10:50000-60000
 [network]
 public_ip = "203.0.113.7"      # optional; detected (and re-checked) automatically otherwise
 ip_check_interval = "60s"
+upnp = true                    # default
 
 [acme]
 enabled = true                 # default

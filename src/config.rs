@@ -268,6 +268,8 @@ pub struct NetworkSection {
     pub public_ip_sources: Vec<String>,
     /// How often to re-check the public IP, e.g. `60s`.
     pub ip_check_interval: Option<String>,
+    /// Open router ports automatically via UPnP / PCP / NAT-PMP (default true).
+    pub upnp: Option<bool>,
 }
 
 /// Let's Encrypt settings for the bare-IP certificate.
