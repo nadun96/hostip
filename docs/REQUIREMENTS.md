@@ -263,19 +263,47 @@ The workload is a **live polling app** and a **video conferencing app**.
   mean building the SFU yourself — out of scope.
 - **SFU must announce the public IP** in ICE candidates — hence F27
   (IP propagation + `on_ip_change` hook to update/restart the SFU).
-- **Capacity with 300 Mbit/s upload** (SFU forwards every stream to every
-  other participant; upload ≈ N × (N−1) × bitrate):
-  - Everyone sees everyone at 720p (~1.5 Mbit/s): **~12–14 participants** in
-    one room.
-  - With simulcast (active speaker in HD, others as ~0.3 Mbit/s thumbnails):
-    **~25–30 participants**.
-  - Audio-only: hundreds. Confirm 300 Mbit/s is the **upload** figure — many
-    home plans are asymmetric (e.g. 300 down / 50 up → ~5–6 people at 720p).
-- **Dynamic IP impact:** when the ISP changes the IP, every in-progress call
-  drops (media is addressed to the old IP), the SFU must restart with the new
-  IP, a new certificate must be issued (~seconds–minutes), and shared links
-  change. Usually rare (days–weeks, often on router reboot), but **a static
-  IP from the ISP is strongly recommended** for conferencing with others.
+- **Capacity: target is 100 participants per call on 300/300 Mbit/s.**
+  An SFU sends each participant a copy of every stream they watch, so host
+  upload ≈ participants × (streams each one receives × bitrate).
+
+  | Call layout (100 participants) | Per-viewer download | Host upload | Fits 300 Mbit/s? |
+  |---|---|---|---|
+  | Everyone sees everyone (100 × 720p) | ~150 Mbit/s | ~15 Gbit/s | ❌ impossible on any home link |
+  | Gallery: speaker 720p + 24 thumbnails | ~1.5 + 24×0.15 ≈ 5 Mbit/s | ~500 Mbit/s | ❌ |
+  | Speaker 720p + 8 thumbnails | ~1.5 + 8×0.15 ≈ 2.7 Mbit/s | ~270 Mbit/s | ⚠️ no headroom |
+  | **Speaker 720p + 4 thumbnails** | ~1.2 + 4×0.15 ≈ 1.8 Mbit/s | **~180 Mbit/s** | ✅ |
+  | **Webinar: ≤ 4 presenters on video, 96 viewers** | ~1.5–2 Mbit/s | **~150–200 Mbit/s** | ✅ |
+  | Audio-only (top 3 speakers forwarded) | ~0.1 Mbit/s | ~10 Mbit/s | ✅ easily |
+
+  **Conclusion:** 100 per call is feasible **only with "last-N" / pagination
+  and simulcast** — each viewer gets the active speaker plus a few small
+  thumbnails, never the whole grid. This must be configured in the existing
+  conferencing app/SFU (LiveKit: adaptive stream + dynacast + simulcast;
+  Jitsi: last-N; mediasoup: app-side). Upload (~100 × 1.5–2.5 Mbit/s with
+  simulcast layers ≈ 150–250 Mbit/s) also fits the 300 Mbit/s download.
+  Allow ~20–30 % headroom for the polling app, retransmits and other use, so
+  plan for **one 100-person call at a time**; several large calls in parallel
+  won't fit.
+- **CPU:** forwarding ~180 Mbit/s of SRTP to 100 peers is within reach of a
+  modern 6–8-core desktop for LiveKit/mediasoup (they forward, not
+  transcode). Load-test before relying on it.
+- **Dynamic IP impact (no static IP available):** the router's public IP
+  can change (typically on router reboot or ISP lease renewal). Then every
+  in-progress call drops, the SFU must restart with the new IP, a new
+  certificate is issued (~seconds–minutes), and — because links use the
+  bare IP — **every shared link changes**. Mitigations:
+  1. hostip detects the change within ≤ 60 s and automates re-issue + SFU
+     restart (F19, F27); the conferencing app should auto-rejoin.
+  2. Avoid router reboots during events; many ISPs keep the same IP as long
+     as the router stays online.
+  3. **Recommended: add a domain name with dynamic DNS** (a cheap domain or a
+     free DDNS name). Links then never change and the cert is for the name;
+     calls still drop on an IP change but participants rejoin the same link.
+     This would replace the bare-IP certificate decision — owner to decide.
+  4. Alternative for a truly static IP: a small VPS with a static IP
+     tunnelling (WireGuard) to the home PC — but then all media flows
+     through the VPS, so its bandwidth (≥ 300 Mbit/s) and cost matter.
 - **Home PC caveats:** the PC must stay on and awake (disable sleep), and
   SFU CPU load grows with participants (fine for tens of users on a modern
   desktop).
@@ -309,7 +337,7 @@ project for async Rust and TLS.
 | Network | ✅ High for the owner (not behind CGNAT); ⚠️ for other users of the tool behind CGNAT |
 | Trusted TLS for public visitors | ✅ High with Let's Encrypt bare-IP cert (needs port 443/80 forwarded; ~6-day certs need reliable renewal); ❌ not achievable with self-signed alone |
 | Live polling | ✅ High — WebSocket/SSE through the proxy |
-| Video conferencing | ✅ Feasible using an existing SFU (LiveKit/mediasoup) + hostip for TLS, signaling, port mapping and IP propagation; ~12–30 people per room on 300 Mbit/s upload; ⚠️ calls drop on IP change |
+| Video conferencing | ✅ Feasible using the existing app/SFU + hostip for TLS, signaling, port mapping and IP propagation; **100 per call fits 300 Mbit/s only with last-N/simulcast (speaker + ~4 thumbnails) or webinar layout**; one large call at a time; ⚠️ calls drop and links change on IP change |
 | Windows host | ✅ High — Rust, rustls, UPnP, Windows service and firewall APIs all supported |
 | Security | ⚠️ Medium — manageable with the defaults above |
 | **Overall** | **Feasible.** Ship a Windows-first, real-time-safe reverse proxy with Let's Encrypt bare-IP certificates, UDP port mapping and public-IP propagation for an existing SFU. Get a static IP if possible. |
@@ -328,7 +356,7 @@ project for async Rust and TLS.
 | Home IP changes (dynamic IP) | Medium–High | High | IP watcher → immediate new cert + new URL (F19), `on_ip_change` restarts SFU (F27); ask ISP for static IP |
 | Calls drop when IP changes | Medium | High | Fast detection (poll every 30–60 s + router UPnP external-IP query), quick SFU restart, client auto-reconnect in the app |
 | Participants behind strict corporate/school firewalls (UDP blocked) | Medium | Medium | TURN over TLS (ideally on 443), SFU TCP fallback |
-| Advertised "300 Mbps" is download only | Medium | High | Measure upload; size room limits accordingly |
+| 100-person call exceeds 300 Mbit/s upload | High if gallery view is used | High | Enforce last-N/simulcast in the SFU; webinar mode; cap participants; monitor egress |
 | Windows sleep/updates restart the PC | Medium | Medium | Service auto-start, disable sleep, schedule update restarts |
 | Upload bandwidth saturated by viewers | High | Medium | Viewer/connection caps, per-client bandwidth caps, adaptive-bitrate streams |
 | Router/ISP blocks or reserves port 443 (router admin UI, ISP policy) | Medium | High | Move router admin off 443/disable WAN admin; diagnostics in self-test |
@@ -415,15 +443,19 @@ route = { port = 7443 }        # separate port: LiveKit expects to own its root 
 - Certificate: **Let's Encrypt certificate for the bare public IP**.
 - Host: **home PC**, **not behind CGNAT** → router port forwarding of 443 (+80).
 - Workload: **live polling app + video conferencing app** (WebRTC); no SSH.
-- Bandwidth: **300 Mbit/s** (to be confirmed as upload).
-- Public IP: **dynamic**.
+- Bandwidth: **300 Mbit/s upload and download**.
+- Public IP: **dynamic**; no static IP available from the ISP.
 - Host OS: **Windows**; hostip runs as a Windows service.
+- Apps: polling and conferencing apps **already exist** — hostip only
+  publishes them.
+- Scale: **~100 participants per call**.
 
 **Open**
-1. Is 300 Mbit/s the **upload** speed (check with a speed test)?
-2. Do the polling and conferencing apps already exist, or are they being
-   built too? If built: which SFU (LiveKit recommended) and stack?
-3. Expected max participants per call and number of simultaneous calls?
+1. Which existing apps exactly (names / stack, which SFU) and on which
+   local ports do they listen? Needed for routing and port mapping.
+2. "100" = 100 people in one call, or 100 simultaneous calls? (The latter
+   does not fit a home connection.)
+3. Domain name + dynamic DNS instead of the bare-IP certificate, so links
+   survive IP changes? (Recommended.)
 4. Can the router forward 443, 80 and a UDP range to the PC, and does it
    support UPnP?
-5. Can you get a static IP from the ISP (strongly recommended for calls)?
