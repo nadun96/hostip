@@ -244,12 +244,21 @@ impl AccessRules {
     /// Takes a slot of this port's connection cap, if one is free.
     pub fn take_slot(&self) -> Option<PortPermit> {
         let max = self.max_connections.unwrap_or(usize::MAX);
-        self.open
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| PortPermit(self.open.clone()))
+        let mut current = self.open.load(Ordering::Relaxed);
+        loop {
+            if current >= max {
+                return None;
+            }
+            match self.open.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(PortPermit(self.open.clone())),
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
