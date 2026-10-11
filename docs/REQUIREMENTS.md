@@ -54,8 +54,14 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 | F14 | CLI: `hostip up`, `hostip add <name> <port>`, `hostip cert {show,regen,export-ca}`, `hostip status`. Quick mode: `hostip 3000`. | Must |
 | F15 | Config file (TOML) with hot reload of routes. | Should |
 | F16 | Graceful shutdown (drain in-flight requests on Ctrl-C/SIGTERM). | Must |
-| F17 | **ACME mode (default when the port is publicly reachable):** obtain a browser-trusted certificate from Let's Encrypt for (a) the bare public IP (short-lived profile) and/or (b) an `sslip.io` hostname for that IP; renew automatically; fall back to self-signed on failure and say so loudly. | Must |
-| F18 | Print a ready-to-share URL on start (e.g. `https://<ip-dashed>.sslip.io:8443`) and a QR code for phones. | Should |
+| F17 | **ACME bare-IP certificate (default mode):** obtain a browser-trusted Let's Encrypt certificate whose only identifier is the public IP (short-lived profile, ~6-day validity), via TLS-ALPN-01 on 443 or HTTP-01 on 80; renew automatically at ~⅓–½ of lifetime; hot-swap without dropping connections; fall back to self-signed on failure and say so loudly. | Must |
+| F18 | Print a ready-to-share URL on start (`https://<public-ip>/…`) and a QR code for phones. | Should |
+| F19 | On public-IP change: immediately request a new IP certificate for the new address and print the new share URL. | Must |
+| F20 | **Streaming:** forward request and response bodies as streams with backpressure — never buffer whole bodies in memory (video files, live HLS/DASH, MJPEG, SSE, large uploads). | Must |
+| F21 | **Streaming:** pass through `Range` / `206 Partial Content`, `Accept-Ranges`, `Content-Length`, chunked transfer encoding unmodified, so video seeking works. | Must |
+| F22 | **Streaming:** separate timeouts — short header/handshake timeout, but no total-request timeout and a generous idle timeout (configurable per app) so long-lived streams aren't cut. | Must |
+| F23 | **Streaming:** per-app limits on concurrent viewers/connections and optional per-client bandwidth cap, to protect home upload bandwidth. | Should |
+| F24 | Disable response compression for media types (video/audio already compressed) and never rewrite media bodies. | Should |
 
 ## 3. Security requirements
 
@@ -77,7 +83,9 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 |------|--------|
 | Platforms | Linux x86_64/aarch64, macOS (arm64/x86_64), Windows x86_64 |
 | Distribution | Single binary, no runtime deps; `cargo install`, GitHub Releases |
-| Performance | ≥ 5k req/s and < 2 ms added p99 latency on a typical laptop for small responses (home upload bandwidth will be the real bottleneck) |
+| Performance | ≥ 5k req/s and < 2 ms added p99 latency on a typical laptop for small responses |
+| Streaming throughput | Saturate a 1 Gbit/s link with TLS on a modern CPU (the home **upload** bandwidth is the real bottleneck); time-to-first-byte overhead < 5 ms |
+| Streaming memory | Bounded per-connection buffers (≤ 64–256 KiB) regardless of stream length or size |
 | Memory | < 30 MB RSS idle |
 | Startup | < 500 ms (excluding first-time key generation) |
 | Observability | `tracing` logs, `RUST_LOG` filter, optional JSON output |
@@ -128,11 +136,12 @@ production scale.
 
 ### 5.3 Network — **Feasible on most home connections, blocked on some**
 
-> **Owner's environment:** confirmed *not* behind CGNAT — the public IP is
-> directly reachable, so inbound hosting works once the port is forwarded /
-> opened in the firewall. (If hostip will run on a cloud VM rather than a home
-> PC, there is no NAT at all; only the provider's firewall / security group
-> and the OS firewall need the port opened.)
+> **Owner's environment:** hostip will run on a **home PC**, confirmed *not*
+> behind CGNAT. Inbound hosting works once the router forwards **TCP 443**
+> (and ideally **80**) to the PC and the OS firewall allows them. Home IPs are
+> often **dynamic** — with a bare-IP certificate and bare-IP URLs, every IP
+> change means a new certificate *and* a new link for viewers (F19). Ask the
+> ISP whether a static IP is available.
 
 | Situation | Outcome |
 |-----------|---------|
@@ -165,7 +174,18 @@ into the v1 MVP.**
 - The cert **must** put the IP in a SAN of type `iPAddress`; browsers ignore
   the Common Name.
 - Keep leaf validity ≤ 397 days (Apple/Chrome limits) and auto-renew.
-- **Trusted-cert options (in order of recommendation):**
+- **Chosen option: Let's Encrypt certificate for the bare IP** (option 2
+  below). Implications:
+  - Validity is only ~6 days → renewal runs every 2–3 days and must be
+    reliable; a failed renewal becomes a visible outage within days, so the
+    status command and logs must show expiry and last renewal result.
+  - Only HTTP-01 (port 80) or TLS-ALPN-01 (port 443) work for IPs; DNS-01
+    is impossible. Port 443 forwarding is therefore mandatory.
+  - No hostnames → no SNI/`Host` routing (§5.2). Multiple apps use **path
+    prefixes** on 443 (app must support a base path, e.g. Jellyfin's "Base
+    URL") or **extra ports** (extra ports reuse the same IP certificate).
+  - Dynamic IP → new cert + new URL each time the ISP changes the IP.
+- **Trusted-cert options considered:**
   1. **Let's Encrypt cert for an `sslip.io` hostname**
      (`203-0-113-7.sslip.io`, resolves to `203.0.113.7`). Standard 90-day
      cert, renewed ~30 days before expiry. Also gives hostname routing
@@ -186,6 +206,26 @@ into the v1 MVP.**
   enough. If the ISP blocks both, ACME is impossible and only self-signed or a
   user-owned domain with DNS-01 remains. Verify the current Let's Encrypt
   IP-certificate policy before implementing.
+
+### 5.5a Streaming — **Feasible; bandwidth is the limit, not the software**
+
+HTTP-based streaming (progressive MP4 with seeking, HLS/DASH, MJPEG, SSE,
+WebSocket-based streams, media servers like Jellyfin/Plex/Navidrome) is a
+plain reverse-proxy workload: hyper bodies are already streams, so F20–F24
+are mostly about *not* doing harmful things (buffering, compressing,
+total-request timeouts).
+
+- **Not covered by an HTTP proxy:** WebRTC (UDP media, needs STUN/TURN and
+  UDP port forwarding) and RTMP/SRT ingest (raw TCP/UDP, e.g. OBS → server).
+  If needed, these require a separate TCP/UDP forwarding mode (v2).
+- **Capacity math (home upload is the bottleneck):** viewers ≈ upload
+  bandwidth ÷ stream bitrate. Example: 20 Mbit/s upload ÷ 5 Mbit/s 1080p ≈
+  **3–4 simultaneous viewers**; 720p at 2.5 Mbit/s ≈ 7. Live streams should
+  offer lower-bitrate renditions (HLS adaptive bitrate) and F23 limits.
+- **Proxy design notes:** use `hyper` streaming bodies end-to-end, keep
+  HTTP/2 flow-control windows reasonable for high-bitrate streams, disable
+  Nagle (`TCP_NODELAY`) for low-latency live streams, and enforce the
+  connection cap before accepting more viewers.
 
 ### 5.5 Security / operational — **Feasible, needs care**
 
@@ -214,9 +254,10 @@ project for async Rust and TLS.
 |-----------|--------|
 | Technical | ✅ High — mature crates, well-understood problem |
 | Network | ✅ High for the owner (not behind CGNAT); ⚠️ for other users of the tool behind CGNAT |
-| Trusted TLS for public visitors | ✅ High with ACME (needs port 443 or 80 reachable); ❌ not achievable with self-signed alone |
+| Trusted TLS for public visitors | ✅ High with Let's Encrypt bare-IP cert (needs port 443/80 forwarded; ~6-day certs need reliable renewal); ❌ not achievable with self-signed alone |
+| Streaming | ✅ High for HTTP-based streaming; limited by home upload bandwidth; ❌ WebRTC/RTMP need a separate mode |
 | Security | ⚠️ Medium — manageable with the defaults above |
-| **Overall** | **Feasible.** Ship port-based routing + ACME (sslip.io hostname / IP cert) + self-signed fallback in v1; add hostname routing on one port next. |
+| **Overall** | **Feasible.** Ship a streaming-safe reverse proxy + Let's Encrypt bare-IP certificates (self-signed fallback) in v1, with path/port routing. |
 
 ---
 
@@ -228,7 +269,10 @@ project for async Rust and TLS.
 | Exposed dev server gets exploited | Medium | High | Auth on by default, loopback-only upstreams, warnings |
 | Browser warnings make it unusable for others | High (self-signed) | High | ACME by default (F17); self-signed only as fallback |
 | ACME challenge fails (ports 80/443 blocked, rate limits) | Medium | High | TLS-ALPN-01 on 443, HTTP-01 fallback, clear diagnostics, self-signed fallback, own-domain option |
-| Short-lived IP cert expires (renewal outage) | Medium | High | Renew at ~half lifetime, retry with backoff, alert in logs/status |
+| Short-lived IP cert expires (renewal outage) | Medium | High | Renew at ~⅓–½ lifetime, retry with backoff, alert in logs/status |
+| Home IP changes (dynamic IP) | Medium–High | High | IP watcher → immediate new cert + new URL (F19); ask ISP for static IP |
+| Upload bandwidth saturated by viewers | High | Medium | Viewer/connection caps, per-client bandwidth caps, adaptive-bitrate streams |
+| Router/ISP blocks or reserves port 443 (router admin UI, ISP policy) | Medium | High | Move router admin off 443/disable WAN admin; diagnostics in self-test |
 | Public IP changes break links/cert | Medium | Medium | IP watcher + cert regen; sslip.io hostnames |
 | UPnP unavailable/disabled | High | Low | Manual port-forward instructions printed by CLI |
 | ISP ToS forbid hosting | Low | Medium | Document; user's responsibility |
@@ -240,11 +284,11 @@ project for async Rust and TLS.
 | Phase | Scope | Estimate |
 |-------|-------|----------|
 | **M1 — MVP** | CLI quick mode, TOML config, port-based routing, self-signed cert with IP SANs, HTTP/1.1 + WebSocket proxy, forwarded headers, graceful shutdown | 1–2 weeks |
-| **M1.5 — Trusted TLS** | ACME (TLS-ALPN-01 + HTTP-01) for sslip.io hostname and bare IP, auto-renew with cert hot-swap, share URL output | ~1 week |
+| **M1.5 — Trusted TLS + streaming** | Let's Encrypt bare-IP cert (TLS-ALPN-01 + HTTP-01, short-lived profile), auto-renew + hot-swap, IP-change re-issue, share URL; streaming-safe bodies, Range passthrough, streaming timeouts | ~1–1.5 weeks |
 | **M2 — Safe by default** | Basic/token auth, rate limiting, timeouts/limits, IP allow/deny, access logs, key file permissions | 1 week |
-| **M3 — Convenience** | Local CA mode + export, sslip.io hostname routing on one port, public-IP watcher + cert regen, reachability/CGNAT self-test, UPnP/NAT-PMP, HTTP/2, path routing, hot reload | 1–2 weeks |
+| **M3 — Convenience** | Local CA mode + export, viewer/bandwidth caps, public-IP watcher + cert regen, reachability/CGNAT self-test, UPnP/NAT-PMP, HTTP/2, path routing, hot reload | 1–2 weeks |
 | **M4 — Distribution** | Cross-platform CI, release binaries, docs, integration tests | ~1 week |
-| **v2 (optional)** | IPv6, VPS relay for CGNAT, web dashboard | 2–4 weeks |
+| **v2 (optional)** | Raw TCP/UDP forwarding (RTMP/SRT ingest, WebRTC/TURN), sslip.io or own-domain hostnames, IPv6, VPS relay for CGNAT, web dashboard | 2–4 weeks |
 
 **Usable public v1: ~5–7 weeks of focused work.**
 
@@ -260,7 +304,8 @@ redirect_http = true           # listen on :80: HTTP-01 challenges + redirect
 [tls]
 mode = "acme"                  # "acme" | "self-signed" | "local-ca" | "files"
 dir = "~/.hostip/certs"
-acme_identifiers = ["sslip", "ip"]   # sslip.io hostname and/or bare public IP
+acme_identifiers = ["ip"]      # bare public IP, Let's Encrypt short-lived profile
+renew_before = "4d"            # renew well before the ~6-day expiry
 acme_email = "you@example.com"
 fallback = "self-signed"       # used if ACME fails; logged as a warning
 
@@ -269,9 +314,11 @@ upnp = true
 public_ip_sources = ["https://api.ipify.org", "https://ifconfig.me/ip"]
 
 [[app]]
-name = "web"
-upstream = "http://127.0.0.1:3000"
-route = { port = 443 }
+name = "media"                 # e.g. Jellyfin with Base URL = /media
+upstream = "http://127.0.0.1:8096"
+route = { path = "/media" }
+idle_timeout = "10m"           # long-lived streams
+max_connections = 6            # protect home upload bandwidth
 auth = { basic = { user = "me", password_hash = "$argon2id$..." } }
 
 [[app]]
@@ -284,15 +331,18 @@ allow = ["203.0.113.0/24"]
 ## 9. Decisions and open questions
 
 **Decided**
-- Audience: **other people / the public**, not just the owner → ACME trusted
+- Audience: **other people / the public**, not just the owner → trusted
   certs are a v1 requirement; self-signed is fallback only.
-- Owner's connection is **not behind CGNAT** → direct inbound hosting is
-  feasible; no relay needed for the owner.
+- Certificate: **Let's Encrypt certificate for the bare public IP**.
+- Host: **home PC**, **not behind CGNAT** → router port forwarding of 443 (+80).
+- Workload: **streaming** (HTTP-based); no SSH / raw TCP needed.
 
 **Open**
-1. Do you need raw TCP (SSH, databases, game servers) or only HTTP(S)?
-2. Can ports 443 and/or 80 be opened (router forward, ISP not blocking)?
-   Required for Let's Encrypt validation.
-3. Is the host a home PC or a cloud VM? (Affects NAT/UPnP vs. security-group setup.)
-4. Is a free shared hostname (sslip.io) acceptable, or will you buy a domain?
-5. Should hostip run as a background service (systemd / Windows service) in v1?
+1. What kind of streaming exactly — media library (Jellyfin/Plex), live
+   HLS from OBS, browser WebRTC, or files? (WebRTC/RTMP need v2 TCP/UDP mode.)
+2. What is your home **upload** speed? (Sets the realistic viewer count.)
+3. Is your home IP static or dynamic? (Dynamic = links change on IP change.)
+4. Can the router forward 443 and 80 to the PC (no ISP block, router admin
+   not on 443)?
+5. Which OS is the home PC? Should hostip run as a background service
+   (systemd / Windows service) in v1?
