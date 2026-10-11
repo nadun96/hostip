@@ -64,6 +64,7 @@ hostip expose [PORTS]... [--config hostip.toml] [--public-ip IP] [--bind ADDR] [
               [--ip-file FILE] [--on-ip-change CMD] [--export-cert FILE --export-key FILE]
               [--on-cert-renew CMD]
 hostip hash-password   # reads a password on stdin, prints an Argon2 hash for the config
+hostip status  # is it running? public links, certificate expiry
 hostip ip      # show the public and LAN IP addresses
 hostip service install --config hostip.toml [--system]   # run in the background
 hostip service uninstall

@@ -23,6 +23,7 @@ use hostip::publicip;
 use hostip::relay;
 use hostip::server::{self, Server, ServerOptions};
 use hostip::service;
+use hostip::status;
 
 const DEFAULT_IP_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const CONFIG_POLL: Duration = Duration::from_secs(2);
@@ -43,6 +44,12 @@ enum Command {
         /// HTTPS endpoints that return the caller's IP as plain text.
         #[arg(long = "source")]
         sources: Vec<String>,
+    },
+    /// Show whether hostip is running, its public links and its certificate.
+    Status {
+        /// Where the running hostip keeps its data (default: next to the certificates).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
     /// Hash a password for `password_hash` in the config file (reads it from stdin).
     HashPassword,
@@ -209,6 +216,19 @@ async fn run(command: Command) -> Result<()> {
             let shutdown = CancellationToken::new();
             tokio::spawn(wait_for_signal(shutdown.clone()));
             expose_with_reload(*args, shutdown).await
+        }
+        Command::Status { data_dir } => {
+            let file = status::path(&data_dir.unwrap_or_else(default_data_dir));
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            match status::read(&file) {
+                Ok(current) => print!("{}", status::render(&current, now)),
+                Err(_) => {
+                    println!("hostip is not running (no {}).", file.display());
+                    println!("For a service or another user, pass --data-dir.");
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
         }
         Command::HashPassword => {
             let mut password = String::new();
@@ -739,6 +759,29 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
     if let Some(export) = export {
         tokio::spawn(hooks::export_certs(certs.clone(), export));
     }
+    {
+        let specs = specs.clone();
+        let mode = match &relay {
+            Some(r) => format!("relay {}", r.address),
+            None => "direct".to_owned(),
+        };
+        let urls = move |ip: Option<IpAddr>| {
+            let host = url_host(&ip.map_or_else(|| "localhost".to_owned(), |ip| ip.to_string()));
+            specs
+                .iter()
+                .filter(|s| s.mode != Mode::Udp)
+                .map(|s| public_url(s, &host))
+                .collect()
+        };
+        tokio::spawn(status::write_periodically(
+            status::path(&default_data_dir()),
+            mode,
+            urls,
+            certs.clone(),
+            ip_rx.clone(),
+            shutdown.clone(),
+        ));
+    }
     tokio::spawn(report_ip_changes(
         ip_rx,
         specs.clone(),
@@ -961,6 +1004,13 @@ fn default_sources() -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// Where hostip keeps its state (the certificate directory's parent).
+fn default_data_dir() -> PathBuf {
+    default_cert_dir()
+        .parent()
+        .map_or_else(|| PathBuf::from(".hostip"), PathBuf::from)
 }
 
 fn default_cert_dir() -> PathBuf {

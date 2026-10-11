@@ -14,3 +14,4 @@ pub mod publicip;
 pub mod relay;
 pub mod server;
 pub mod service;
+pub mod status;

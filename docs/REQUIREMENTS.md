@@ -540,7 +540,7 @@ protocol = "udp"
 | F10 | ✅ | Port-80 listener: ACME HTTP-01 + redirect to https |
 | F12, F26 | ✅ | UPnP-IGD with PCP/NAT-PMP fallback, leases renewed, removed on exit (`src/portmap.rs`; fake-router tests) |
 | F13, F29 | 🟡 | Double-NAT/CGNAT warning from the router's WAN address; Let's Encrypt validation proves 443/80 reachability. No independent outside probe yet |
-| F14 | 🟡 | `expose`, `ip`, `cert`, `hash-password`, `service`, `relay`; no `status` command |
+| F14 | ✅ | `expose`, `status`, `ip`, `cert`, `hash-password`, `service`, `relay` |
 | F15 | ✅ | Config file polled; valid changes restart the listeners in-process, invalid ones are rejected |
 | F16 | ✅ | Graceful shutdown with drain (Ctrl+C, SIGTERM, service stop) |
 | F17 | ✅ | Let's Encrypt bare-IP certificates, short-lived profile, TLS-ALPN-01 + HTTP-01 with rotation, renewal at ⅔ lifetime (`src/acme.rs`; Pebble tests) |
