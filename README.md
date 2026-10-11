@@ -40,7 +40,13 @@ Milestones **M1** and **M1.5** are done:
   the new IP), and the served certificate exported as PEM with an
   `on_cert_renew` command (e.g. reload a TURN-over-TLS server)
 
-Not done yet: Windows service and firewall setup, relay mode.
+- **Background service**: `hostip service install` registers a Windows
+  service (auto-start, restart on failure, low-privilege LocalService account,
+  log in `%ProgramData%\hostip\hostip.log`) and opens the Windows Firewall
+  ports; on Linux it installs a hardened systemd unit
+
+Not done yet: relay mode (for networks where no port can be opened), release
+packaging.
 
 ## Usage
 
@@ -52,6 +58,8 @@ hostip expose [PORTS]... [--config hostip.toml] [--public-ip IP] [--bind ADDR] [
               [--on-cert-renew CMD]
 hostip hash-password   # reads a password on stdin, prints an Argon2 hash for the config
 hostip ip      # show the public and LAN IP addresses
+hostip service install --config hostip.toml [--system]   # run in the background
+hostip service uninstall
 hostip cert    # show the stored certificate
 ```
 
@@ -115,6 +123,25 @@ The `on_ip_change` command runs at start and after every change with
 `HOSTIP_PUBLIC_IP` and `HOSTIP_PREVIOUS_IP` set; `on_cert_renew` gets
 `HOSTIP_CERT_FILE` and `HOSTIP_KEY_FILE`. Commands run through `cmd /C` on
 Windows and `sh -c` elsewhere.
+
+### Running in the background
+
+Put the ports and settings in a config file, then from an **Administrator**
+prompt:
+
+```
+hostip service install --config C:\hostip\hostip.toml
+```
+
+This installs and starts the `hostip` Windows service (starts with Windows,
+restarts on failure) and adds inbound Windows Firewall rules for exactly the
+ports in the config. It runs as the low-privilege LocalService account;
+use `--system` if your hooks need to restart other services. Certificates and
+the log live in `%ProgramData%\hostip`. `hostip service uninstall` removes the
+service and the firewall rules.
+
+On Linux the same command installs a systemd unit (`journalctl -u hostip -f`
+for logs).
 
 ### Router port forwarding
 

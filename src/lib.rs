@@ -12,3 +12,4 @@ pub mod portmap;
 pub mod proxy;
 pub mod publicip;
 pub mod server;
+pub mod service;

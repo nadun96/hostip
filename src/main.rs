@@ -18,6 +18,7 @@ use hostip::hooks::{self, CertExport, IpHooks};
 use hostip::portmap::{self, DiscoverOptions};
 use hostip::publicip;
 use hostip::server::{self, Server, ServerOptions};
+use hostip::service;
 
 const DEFAULT_IP_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -40,6 +41,9 @@ enum Command {
     },
     /// Hash a password for `password_hash` in the config file (reads it from stdin).
     HashPassword,
+    /// Run hostip in the background (Windows service or systemd unit).
+    #[command(subcommand)]
+    Service(ServiceCommand),
     /// Show the stored certificate.
     Cert {
         #[arg(long)]
@@ -47,7 +51,29 @@ enum Command {
     },
 }
 
-#[derive(Args)]
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install and start the background service for this config file
+    /// (Windows: run from an Administrator prompt; also opens the Windows Firewall ports).
+    Install {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Windows: run as LocalSystem instead of the low-privilege LocalService
+        /// (needed when hooks must restart other services).
+        #[arg(long)]
+        system: bool,
+    },
+    /// Stop and remove the background service and its firewall rules.
+    Uninstall,
+    /// Entry point used by the Windows Service Control Manager.
+    #[command(hide = true)]
+    Run {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Args, Default)]
 struct ExposeArgs {
     /// Ports as `[mode:]local[:public]`; mode is auto (default), https, tls, tcp or udp.
     /// Examples: 3000, 3000:443, tls:5000, udp:3478, udp:50000-60000.
@@ -115,16 +141,31 @@ struct ExposeArgs {
     on_cert_renew: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Command::Service(ServiceCommand::Run { config }) = cli.command {
+        return run_service(config);
+    }
+    init_console_logging();
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(run(cli.command))
+}
+
+fn init_console_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hostip=info")),
         )
         .init();
+}
 
-    match Cli::parse().command {
-        Command::Expose(args) => expose(*args).await,
+async fn run(command: Command) -> Result<()> {
+    match command {
+        Command::Expose(args) => {
+            let shutdown = CancellationToken::new();
+            tokio::spawn(wait_for_signal(shutdown.clone()));
+            expose(*args, shutdown).await
+        }
         Command::HashPassword => {
             let mut password = String::new();
             std::io::stdin().read_line(&mut password)?;
@@ -147,6 +188,11 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Service(ServiceCommand::Install { config, system }) => {
+            install_service(&config, system)
+        }
+        Command::Service(ServiceCommand::Uninstall) => uninstall_service(),
+        Command::Service(ServiceCommand::Run { .. }) => unreachable!("handled in main"),
         Command::Cert { cert_dir } => {
             let dir = cert_dir.unwrap_or_else(default_cert_dir);
             match cert::stored_info(&dir) {
@@ -164,7 +210,116 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn expose(args: ExposeArgs) -> Result<()> {
+/// Checks the config and returns its absolute path plus the firewall rules it needs.
+fn prepare_service(config: &std::path::Path) -> Result<(PathBuf, Vec<service::FirewallRule>)> {
+    let config = std::fs::canonicalize(config)
+        .map_err(|e| anyhow::anyhow!("cannot find {}: {e}", config.display()))?;
+    let args = ExposeArgs {
+        config: Some(config.clone()),
+        ..ExposeArgs::default()
+    };
+    let (file, specs) = load_specs(&args)?;
+    let http_listen = Some(file.server.http_listen.unwrap_or(80)).filter(|p| *p != 0);
+    Ok((config, service::firewall_rules(&specs, http_listen)))
+}
+
+#[cfg(windows)]
+fn install_service(config: &std::path::Path, system: bool) -> Result<()> {
+    let (config, rules) = prepare_service(config)?;
+    service::windows::install(&config, &rules, system)?;
+    println!(
+        "Installed and started the hostip service for {}.",
+        config.display()
+    );
+    for rule in &rules {
+        println!(
+            "Windows Firewall: allowed inbound {} {}",
+            rule.proto, rule.ports
+        );
+    }
+    println!("Log: {}", service::windows::log_path().display());
+    Ok(())
+}
+
+#[cfg(windows)]
+fn uninstall_service() -> Result<()> {
+    service::windows::uninstall()?;
+    println!("Removed the hostip service and its firewall rules.");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn run_service(config: PathBuf) -> Result<()> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(service::windows::log_path())?;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hostip=info")),
+        )
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(log))
+        .init();
+    service::windows::run(config, |config, shutdown| {
+        let args = ExposeArgs {
+            config: Some(config),
+            ..ExposeArgs::default()
+        };
+        tokio::runtime::Runtime::new()?.block_on(expose(args, shutdown))
+    })
+}
+
+#[cfg(not(windows))]
+fn install_service(config: &std::path::Path, _system: bool) -> Result<()> {
+    let (config, _) = prepare_service(config)?;
+    let unit = service::systemd_unit(&std::env::current_exe()?, &config);
+    let path = std::path::Path::new("/etc/systemd/system/hostip.service");
+    if cfg!(target_os = "linux") && std::fs::write(path, &unit).is_ok() {
+        let status = std::process::Command::new("systemctl")
+            .args(["daemon-reload"])
+            .status()
+            .and_then(|_| {
+                std::process::Command::new("systemctl")
+                    .args(["enable", "--now", "hostip"])
+                    .status()
+            })?;
+        if !status.success() {
+            bail!("systemctl enable --now hostip failed");
+        }
+        println!("Installed and started {}.", path.display());
+        println!("Logs: journalctl -u hostip -f");
+        println!("Open the ports in your firewall (e.g. ufw) if it blocks inbound traffic.");
+    } else {
+        println!(
+            "Save this as {} and run `systemctl enable --now hostip` as root:\n",
+            path.display()
+        );
+        print!("{unit}");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn uninstall_service() -> Result<()> {
+    let _ = std::process::Command::new("systemctl")
+        .args(["disable", "--now", "hostip"])
+        .status();
+    let path = std::path::Path::new("/etc/systemd/system/hostip.service");
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    println!("Removed the hostip systemd unit.");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn run_service(_config: PathBuf) -> Result<()> {
+    bail!("`hostip service run` is only used by Windows; on Linux the unit runs `hostip expose`")
+}
+
+/// The config file plus the port specs from it and the command line, validated.
+fn load_specs(args: &ExposeArgs) -> Result<(FileConfig, Vec<PortSpec>)> {
     let file = match &args.config {
         Some(path) => FileConfig::load(path)?,
         None => FileConfig::default(),
@@ -193,6 +348,11 @@ async fn expose(args: ExposeArgs) -> Result<()> {
         );
     }
     validate_specs(&specs)?;
+    Ok((file, specs))
+}
+
+async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
+    let (file, specs) = load_specs(&args)?;
 
     let sources = if file.network.public_ip_sources.is_empty() {
         default_sources()
@@ -310,9 +470,6 @@ async fn expose(args: ExposeArgs) -> Result<()> {
     server::log_ready(&server.local_addrs());
     let upnp = !args.no_upnp && file.network.upnp.unwrap_or(true);
     print_summary(&specs, &host, lan_ip, http_bound, acme_active, upnp);
-
-    let shutdown = CancellationToken::new();
-    tokio::spawn(wait_for_signal(shutdown.clone()));
 
     // Public IP tracking (F7, F19): only when the IP was detected, not given.
     let (ip_tx, ip_rx) = watch::channel(public_ip);
