@@ -25,6 +25,7 @@ use hostip::server::{self, Server, ServerOptions};
 use hostip::service;
 
 const DEFAULT_IP_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const CONFIG_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Parser)]
 #[command(version, about = "Publish local apps on your public IP over HTTPS")]
@@ -98,7 +99,7 @@ struct RelayArgs {
     data_dir: Option<PathBuf>,
 }
 
-#[derive(Args, Default)]
+#[derive(Args, Default, Clone)]
 struct ExposeArgs {
     /// Ports as `[mode:]local[:public]`; mode is auto (default), https, tls, tcp or udp.
     /// Examples: 3000, 3000:443, tls:5000, udp:3478, udp:50000-60000.
@@ -207,7 +208,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Expose(args) => {
             let shutdown = CancellationToken::new();
             tokio::spawn(wait_for_signal(shutdown.clone()));
-            expose(*args, shutdown).await
+            expose_with_reload(*args, shutdown).await
         }
         Command::HashPassword => {
             let mut password = String::new();
@@ -368,7 +369,7 @@ fn run_service(config: PathBuf) -> Result<()> {
             config: Some(config),
             ..ExposeArgs::default()
         };
-        tokio::runtime::Runtime::new()?.block_on(expose(args, shutdown))
+        tokio::runtime::Runtime::new()?.block_on(expose_with_reload(args, shutdown))
     })
 }
 
@@ -418,6 +419,38 @@ fn uninstall_service() -> Result<()> {
 #[cfg(not(windows))]
 fn run_service(_config: PathBuf) -> Result<()> {
     bail!("`hostip service run` is only used by Windows; on Linux the unit runs `hostip expose`")
+}
+
+/// Runs `expose`, restarting it whenever the config file changes to a valid config (F15).
+async fn expose_with_reload(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
+    let Some(path) = args.config.clone() else {
+        return expose(args, shutdown).await;
+    };
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    loop {
+        let mut seen = modified(&path);
+        let run = shutdown.child_token();
+        let task = expose(args.clone(), run.clone());
+        tokio::pin!(task);
+        loop {
+            tokio::select! {
+                result = &mut task => return result,
+                _ = tokio::time::sleep(CONFIG_POLL) => {}
+            }
+            let now = modified(&path);
+            if now == seen {
+                continue;
+            }
+            seen = now;
+            match load_specs(&args) {
+                Ok(_) => break,
+                Err(e) => warn!("config changed but is invalid, keeping the current one: {e:#}"),
+            }
+        }
+        info!("config changed; restarting with the new settings (open connections are closed)");
+        run.cancel();
+        task.await?;
+    }
 }
 
 /// The config file plus the port specs from it and the command line, validated.

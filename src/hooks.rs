@@ -82,15 +82,19 @@ fn write_atomic(path: &Path, contents: &[u8], private: bool) -> Result<()> {
 }
 
 /// Publishes the current public IP at start and after every change.
+/// The last IP handed to the hooks in this process, so a config reload does not
+/// re-run `on_ip_change` (and e.g. restart a media server) for an unchanged IP.
+static LAST_PUBLISHED: std::sync::Mutex<Option<IpAddr>> = std::sync::Mutex::new(None);
+
 pub async fn watch_ip(mut ip: watch::Receiver<Option<IpAddr>>, hooks: IpHooks) {
-    let mut previous: Option<IpAddr> = None;
     loop {
         let current = *ip.borrow_and_update();
+        let previous = *LAST_PUBLISHED.lock().unwrap();
         if let Some(addr) = current
             && current != previous
         {
             publish_ip(addr, previous, &hooks).await;
-            previous = current;
+            *LAST_PUBLISHED.lock().unwrap() = current;
         }
         if ip.changed().await.is_err() {
             return;

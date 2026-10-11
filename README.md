@@ -109,6 +109,13 @@ If an app only listens with TLS (often with its own self-signed certificate),
 set `upstream_tls = true` on its `[[port]]`; hostip then connects to it over
 TLS. Its certificate is not checked, since the connection never leaves this PC.
 
+### Changing the config while running
+
+hostip watches the config file. When it changes and is valid, hostip restarts
+its listeners with the new settings (open connections are closed; certificates
+are kept and `on_ip_change` is not re-run for an unchanged IP). An invalid edit
+is reported and the running setup is kept.
+
 ### Who can connect
 
 By default anyone with the link can open an HTTP port. To require a login:
