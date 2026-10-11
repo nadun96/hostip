@@ -22,6 +22,15 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Asks each source in turn for this machine's public IP and returns the first answer.
 pub async fn detect(sources: &[String]) -> Result<IpAddr> {
+    detect_matching(sources, |_| true).await
+}
+
+/// Like [`detect`], but ignores answers `accept` rejects (e.g. the other address family:
+/// some services answer with IPv6 when the machine has it).
+pub async fn detect_matching(
+    sources: &[String],
+    accept: impl Fn(IpAddr) -> bool,
+) -> Result<IpAddr> {
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_only()
@@ -32,7 +41,8 @@ pub async fn detect(sources: &[String]) -> Result<IpAddr> {
     let mut errors = Vec::new();
     for source in sources {
         match tokio::time::timeout(LOOKUP_TIMEOUT, query(&client, source)).await {
-            Ok(Ok(ip)) => return Ok(ip),
+            Ok(Ok(ip)) if accept(ip) => return Ok(ip),
+            Ok(Ok(ip)) => errors.push(format!("{source}: answered {ip} (other address family)")),
             Ok(Err(e)) => errors.push(format!("{source}: {e:#}")),
             Err(_) => errors.push(format!("{source}: timed out")),
         }
@@ -58,9 +68,36 @@ where
         .with_context(|| format!("not an IP address: `{text}`"))
 }
 
+/// How long to wait before re-checking an apparent IP change.
+const CONFIRM_DELAY: Duration = Duration::from_secs(10);
+
 /// Re-checks the public IP every `interval` and publishes changes (F7, F19).
+///
+/// A change re-issues certificates and restarts hooks, so it is only published
+/// after a second lookup confirms it, and answers in the other address family
+/// than the current IP are ignored.
 pub async fn watch(
     sources: Vec<String>,
+    interval: Duration,
+    tx: watch::Sender<Option<IpAddr>>,
+    shutdown: CancellationToken,
+) {
+    let sources = std::sync::Arc::new(sources);
+    let lookup = move |current: Option<IpAddr>| {
+        let sources = sources.clone();
+        Box::pin(async move {
+            let same_family = |ip: IpAddr| current.is_none_or(|c| c.is_ipv4() == ip.is_ipv4());
+            detect_matching(&sources, same_family).await
+        }) as Lookup
+    };
+    watch_with(lookup, interval, tx, shutdown).await;
+}
+
+type Lookup = std::pin::Pin<Box<dyn std::future::Future<Output = Result<IpAddr>> + Send>>;
+
+/// [`watch`] with the lookup supplied (given the current IP, return the public IP).
+pub async fn watch_with(
+    lookup: impl Fn(Option<IpAddr>) -> Lookup,
     interval: Duration,
     tx: watch::Sender<Option<IpAddr>>,
     shutdown: CancellationToken,
@@ -70,19 +107,32 @@ pub async fn watch(
             _ = shutdown.cancelled() => return,
             _ = tokio::time::sleep(interval) => {}
         }
-        match detect(&sources).await {
+        let current = *tx.borrow();
+        let observed = match lookup(current).await {
+            Ok(ip) if Some(ip) == current => continue,
             Ok(ip) => {
-                tx.send_if_modified(|current| {
-                    if *current == Some(ip) {
-                        return false;
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(CONFIRM_DELAY) => {}
+                }
+                match lookup(current).await {
+                    Ok(again) if again == ip => Ok(ip),
+                    Ok(again) => {
+                        debug!("public IP looked like {ip}, then {again}; not changing it yet");
+                        continue;
                     }
-                    info!(
-                        "public IP changed: {} -> {ip}",
-                        current.map_or("none".into(), |c| c.to_string())
-                    );
-                    *current = Some(ip);
-                    true
-                });
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        match observed {
+            Ok(ip) => {
+                info!(
+                    "public IP changed: {} -> {ip}",
+                    current.map_or("none".into(), |c| c.to_string())
+                );
+                tx.send_replace(Some(ip));
             }
             // Transient: keep the last known IP.
             Err(e) => debug!("public IP check failed: {e:#}"),
@@ -118,6 +168,47 @@ pub fn is_non_public(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lookup that answers from a script, one entry per call (the last one repeats).
+    fn scripted(answers: &[&str]) -> impl Fn(Option<IpAddr>) -> Lookup + use<> {
+        let answers: Vec<IpAddr> = answers.iter().map(|a| a.parse().unwrap()).collect();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        move |_current| {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ip = answers[n.min(answers.len() - 1)];
+            Box::pin(async move { Ok(ip) }) as Lookup
+        }
+    }
+
+    async fn run_watch(start: &str, answers: &[&str], checks: u32) -> Option<IpAddr> {
+        let (tx, rx) = watch::channel(Some(start.parse().unwrap()));
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(watch_with(
+            scripted(answers),
+            Duration::from_secs(60),
+            tx,
+            shutdown.clone(),
+        ));
+        for _ in 0..checks {
+            tokio::time::sleep(Duration::from_secs(61) + CONFIRM_DELAY).await;
+        }
+        shutdown.cancel();
+        task.await.unwrap();
+        *rx.borrow()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publishes_confirmed_ip_changes() {
+        let ip = run_watch("203.0.113.7", &["198.51.100.9"], 1).await;
+        assert_eq!(ip, Some("198.51.100.9".parse().unwrap()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ignores_one_off_answers() {
+        // One wrong answer (e.g. a captive portal), then the real IP again.
+        let ip = run_watch("203.0.113.7", &["198.51.100.9", "203.0.113.7"], 2).await;
+        assert_eq!(ip, Some("203.0.113.7".parse().unwrap()));
+    }
 
     #[test]
     fn classifies_addresses() {

@@ -39,6 +39,7 @@ x509-parser = "0.18.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.53.2", features = ["full", "test-util"] }
 
 [target."cfg(windows)".dependencies]
 windows-service = "0.8.1"

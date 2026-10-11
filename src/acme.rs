@@ -159,6 +159,9 @@ pub struct AcmeManager {
     http: Arc<HttpChallenges>,
     account: OnceCell<Account>,
     fallback: OnceLock<Fallback>,
+    /// Counts attempts so retries alternate between the usable challenge types
+    /// (e.g. when the ISP blocks 443 but not 80).
+    attempts: std::sync::atomic::AtomicUsize,
 }
 
 impl AcmeManager {
@@ -169,6 +172,7 @@ impl AcmeManager {
             http,
             account: OnceCell::new(),
             fallback: OnceLock::new(),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -271,9 +275,15 @@ impl AcmeManager {
 
     /// Runs one complete ACME order for `ip` and stores the result.
     pub async fn issue(&self, ip: IpAddr) -> Result<Issued> {
-        let kind = *self.opts.challenges.first().context(
-            "no ACME challenge can work: publish a port on public 443 in auto/https mode, or enable the HTTP port (80)",
-        )?;
+        if self.opts.challenges.is_empty() {
+            bail!(
+                "no ACME challenge can work: publish a port on public 443 in auto/https mode, or enable the HTTP port (80)"
+            );
+        }
+        let attempt = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let kind = self.opts.challenges[attempt % self.opts.challenges.len()];
         let account = self.account().await?;
         let identifiers = [Identifier::Ip(ip)];
         let mut request = NewOrder::new(&identifiers);

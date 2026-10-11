@@ -145,6 +145,10 @@ impl Drop for Setup {
 
 /// Starts hostip the way a home PC would run it: public 443 (TLS) and 80 (HTTP) forwarded to it.
 async fn start_hostip(pebble: &Pebble, kind: ChallengeKind) -> Setup {
+    start_hostip_with(pebble, vec![kind], true).await
+}
+
+async fn start_hostip_with(pebble: &Pebble, kinds: Vec<ChallengeKind>, http_ok: bool) -> Setup {
     let dir = tempfile::tempdir().unwrap();
     let (key, _) = cert::load_or_generate(dir.path(), &["127.0.0.1".into()]).unwrap();
     let certs = CertStore::new(key);
@@ -162,7 +166,13 @@ async fn start_hostip(pebble: &Pebble, kind: ChallengeKind) -> Setup {
         .await
         .unwrap();
     server
-        .bind_http(LOCALHOST, pebble.http_port, challenges.clone(), Some(443))
+        // Without `http_ok`, port 80 answers from somewhere else, as if the ISP blocked it.
+        .bind_http(
+            LOCALHOST,
+            if http_ok { pebble.http_port } else { 0 },
+            challenges.clone(),
+            Some(443),
+        )
         .await
         .unwrap();
     let shutdown = CancellationToken::new();
@@ -174,7 +184,7 @@ async fn start_hostip(pebble: &Pebble, kind: ChallengeKind) -> Setup {
         profile: Some("shortlived".into()),
         ca_root: Some(pebble.ca_root.clone()),
         dir: dir.path().join("acme"),
-        challenges: vec![kind],
+        challenges: kinds,
         renew_before: None,
     };
     Setup {
@@ -249,4 +259,22 @@ async fn manager_swaps_in_issued_certificate() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("certificate was not swapped in");
+}
+
+#[tokio::test]
+async fn retries_with_the_other_challenge_type() {
+    let Some(pebble) = start_pebble().await else {
+        return;
+    };
+    // HTTP-01 is preferred here but port 80 is unreachable; the retry uses TLS-ALPN-01.
+    let setup = start_hostip_with(
+        &pebble,
+        vec![ChallengeKind::Http01, ChallengeKind::TlsAlpn01],
+        false,
+    )
+    .await;
+    let ip = Ipv4Addr::LOCALHOST.into();
+    assert!(setup.manager.issue(ip).await.is_err());
+    let issued = setup.manager.issue(ip).await.unwrap();
+    assert!(issuer_of(&issued.key).contains("Pebble"));
 }

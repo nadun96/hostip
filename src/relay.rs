@@ -34,6 +34,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::access::{Guard, Limits};
 use crate::config::PortRange;
 use crate::server::Injector;
 
@@ -45,6 +46,8 @@ const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_REGISTER_INTERVAL: Duration = Duration::from_secs(15);
 const UDP_SESSION_IDLE: Duration = Duration::from_secs(120);
 const MAX_UDP_SESSIONS: usize = 10_000;
+/// Visitors waiting for home to attach a tunnel.
+const MAX_PENDING: usize = 4096;
 const UDP_MAGIC: u8 = 0x48;
 const UDP_REGISTER: u8 = 1;
 const UDP_DATA: u8 = 2;
@@ -257,6 +260,9 @@ struct RelayState {
     sessions: Mutex<UdpSessions>,
     public_udp: Mutex<HashMap<u16, Arc<UdpSocket>>>,
     control_udp: Arc<UdpSocket>,
+    /// Per-visitor-IP limits, so floods are stopped here instead of making home
+    /// open a tunnel for every connection.
+    guard: Arc<Guard>,
 }
 
 /// Runs the relay until `shutdown`. `tls` is the relay's own certificate.
@@ -283,6 +289,7 @@ pub async fn run_relay(
         sessions: Mutex::new(UdpSessions::default()),
         public_udp: Mutex::new(HashMap::new()),
         control_udp,
+        guard: Guard::new(Limits::default()),
     });
     tokio::spawn(relay_udp_control(state.clone()));
     tokio::spawn(expire_udp_sessions(state.clone(), shutdown.clone()));
@@ -491,8 +498,17 @@ async fn relay_public_tcp(state: Arc<RelayState>, listener: TcpListener, port: u
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
+        let Ok(permit) = state.guard.admit(client.ip().to_canonical()) else {
+            debug!(%client, "relay: visitor over the per-IP limits");
+            continue;
+        };
+        if state.pending.lock().unwrap().len() >= MAX_PENDING {
+            debug!(%client, "relay: too many visitors waiting for home");
+            continue;
+        }
         let state = state.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let _ = visitor.set_nodelay(true);
             let control = state
                 .home
