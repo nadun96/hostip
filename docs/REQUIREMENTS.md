@@ -28,7 +28,8 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 - Single static binary for Linux, macOS and Windows.
 
 ### Non-goals (v1)
-- Traversing CGNAT / double NAT without a relay (see §5.3 — needs a VPS).
+- Accepting inbound connections with **no** router mapping and **no** relay —
+  physically impossible behind NAT; see the connectivity ladder in §5.3b.
 - Proxying raw TCP/UDP itself (games, SSH, databases). WebRTC media goes
   **directly** from the router to the conferencing media server's UDP ports;
   hostip only *opens/maps* those ports and keeps the server's public IP
@@ -54,7 +55,7 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 | F9 | HTTP/2 to clients (ALPN `h2`, `http/1.1`). | Should |
 | F10 | Optional plain-HTTP listener on port 80 that only redirects to HTTPS. | Could |
 | F11 | Set `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `Forwarded` headers; optionally rewrite `Host`. | Must |
-| F12 | Optional router auto-config via UPnP-IGD / NAT-PMP / PCP, with automatic removal of the mapping on exit. | Could |
+| F12 | Router auto-config via UPnP-IGD / NAT-PMP / PCP, with automatic removal of the mapping on exit. | Must |
 | F13 | Reachability self-test: report whether the public IP:port is actually reachable from outside (and detect CGNAT by comparing WAN IP vs. public IP). | Should |
 | F14 | CLI: `hostip up`, `hostip add <name> <port>`, `hostip cert {show,regen,export-ca}`, `hostip status`. Quick mode: `hostip 3000`. | Must |
 | F15 | Config file (TOML) with hot reload of routes. | Should |
@@ -69,6 +70,8 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 | F24 | Disable response compression for media types (video/audio already compressed) and never rewrite media bodies. | Should |
 | F25 | **Real-time web:** WebSocket, SSE and HTTP long-polling stay open indefinitely while active (live poll results, chat, conferencing signaling); no response buffering for `text/event-stream`. | Must |
 | F26 | **WebRTC port mapping:** map the media server's UDP port range (and TCP fallback port) on the router via UPnP/NAT-PMP, renew leases, remove on exit; print exact manual port-forward rules when UPnP is unavailable. | Must |
+| F35 | **Works without UPnP / port forwarding:** walk the connectivity ladder (§5.3b) automatically and pick the first path that the reachability self-test confirms; report which one is active. | Must |
+| F36 | **Relay mode:** `hostip relay` runs on any machine with a public IP (small VPS); the home `hostip` dials *out* to it over one TLS/QUIC connection and the relay forwards TCP and UDP ports back through it. No inbound router config needed at home. The certificate is then issued for the **relay's** IP. | Must |
 | F27 | **Public-IP propagation:** on start and on every IP change, expose the current public IP to apps — write it to a file, set it in an env file, and run a configurable `on_ip_change` hook (e.g. restart/reconfigure the SFU so it announces the new IP in ICE candidates). | Must |
 | F28 | **Certificate export:** write the current IP certificate + key as PEM to a configurable path (and run `on_cert_renew` hook) so a TURN-over-TLS server can reuse the same trusted cert. | Should |
 | F30 | Per-port **mode** (§5.2a): `auto` (default), `https`, `tls`, `tcp`, `udp`. | Must |
@@ -196,11 +199,30 @@ support from the app. One Let's Encrypt IP certificate covers every port.
 | PC directly on public IP (no router) | ✅ Works; OS firewall rule needed |
 | ISP blocks inbound 80/443 | ⚠️ Use a high port (e.g. 8443) |
 | Dynamic public IP | ⚠️ Works; cert regeneration (F7) + DDNS/sslip.io hostname changes |
-| **CGNAT** (common on mobile/4G/5G and some fibre ISPs) | ❌ No inbound possible. Needs a relay (VPS tunnel) — out of scope for v1, candidate for v2 |
+| **CGNAT** (common on mobile/4G/5G and some fibre ISPs) | ❌ No direct inbound possible → relay mode (F36) |
 | IPv6 available | ✅ Often easier (no NAT); needs firewall pinhole on router. Support `[::]` listening |
 
 The F13 self-test should detect CGNAT (router WAN IP in `100.64.0.0/10` or
 differs from the observed public IP) and tell the user clearly.
+
+### 5.3b Connectivity ladder — working without UPnP or port forwarding
+
+Inbound connections to a PC behind a NAT router need *something* to tell
+the router where to send them. hostip tries, in order:
+
+| # | Path | Needs | Notes |
+|---|------|-------|-------|
+| 1 | Already reachable (manual forward, DMZ, no NAT) | nothing | Detected by the self-test |
+| 2 | UPnP-IGD | UPnP enabled on router | Automatic |
+| 3 | NAT-PMP / PCP | router support | Automatic |
+| 4 | IPv6 direct | ISP + router IPv6, inbound allowed | Only IPv6-capable visitors can connect; cert for the IPv6 address |
+| 5 | **Relay mode (F36)** | any server with a public IP (VPS) running `hostip relay` | Works behind any NAT/CGNAT and with no router access. Traffic and certificate use the relay's IP; relay bandwidth must cover the call (~200 Mbit/s for a 100-person call) |
+| 6 | Manual instructions | user configures router | Printed if all else fails |
+
+WebRTC media itself can often traverse NAT without forwarding (ICE + STUN
+hole punching), but the HTTPS page, signaling and TURN still need one of the
+paths above. **There is no way to serve inbound HTTPS from behind NAT with no
+router mapping and no relay**; relay mode is the "works anyway" option.
 
 ### 5.4 TLS — **self-signed is not enough for public visitors; ACME is required**
 
@@ -394,7 +416,8 @@ project for async Rust and TLS.
 | Upload bandwidth saturated by viewers | High | Medium | Viewer/connection caps, per-client bandwidth caps, adaptive-bitrate streams |
 | Router/ISP blocks or reserves port 443 (router admin UI, ISP policy) | Medium | High | Move router admin off 443/disable WAN admin; diagnostics in self-test |
 | Public IP changes break links/cert | Medium | Medium | IP watcher + cert regen; sslip.io hostnames |
-| UPnP unavailable/disabled | High | Low | Manual port-forward instructions printed by CLI |
+| UPnP unavailable/disabled | High | Medium | NAT-PMP/PCP, IPv6, relay mode (F36), manual instructions |
+| Relay VPS bandwidth/cost for large calls | Medium | Medium | Size VPS for ≥ 300 Mbit/s; prefer direct paths when available |
 | ISP ToS forbid hosting | Low | Medium | Document; user's responsibility |
 
 ---
@@ -408,10 +431,11 @@ project for async Rust and TLS.
 | **M2 — Safe by default** | Basic/token auth, rate limiting, timeouts/limits, IP allow/deny, access logs, key file permissions | 1 week |
 | **M2.5 — Conferencing & Windows** | UDP port-range mapping via UPnP (F26), IP propagation + hooks (F27), cert export (F28), Windows service, firewall-rule install, port-conflict detection, LiveKit integration guide | ~1.5 weeks |
 | **M3 — Convenience** | Local CA mode + export, viewer/bandwidth caps, public-IP watcher + cert regen, reachability/CGNAT self-test, UPnP/NAT-PMP, HTTP/2, path routing, hot reload | 1–2 weeks |
+| **M3.5 — Relay mode** | `hostip relay` server, outbound tunnel (TCP + UDP multiplexed), cert for relay IP, connectivity ladder auto-selection | ~2 weeks |
 | **M4 — Distribution** | Cross-platform CI, release binaries, docs, integration tests | ~1 week |
-| **v2 (optional)** | Raw TCP/UDP proxying (RTMP/SRT ingest), TURN/HTTPS multiplexing on 443 (ALPN), sslip.io or own-domain hostnames, IPv6, VPS relay for CGNAT, web dashboard | 2–4 weeks |
+| **v2 (optional)** | Raw TCP/UDP proxying (RTMP/SRT ingest), TURN/HTTPS multiplexing on 443 (ALPN), sslip.io or own-domain hostnames, web dashboard | 2–4 weeks |
 
-**Usable public v1: ~6–9 weeks of focused work** (excluding building the polling and conferencing apps themselves).
+**Usable public v1: ~8–11 weeks of focused work** (excluding building the polling and conferencing apps themselves).
 
 ---
 
@@ -490,7 +514,9 @@ protocol = "udp"
 - Scale: **~100 participants in one call** (one large call at a time).
 - Certificate: **stay with the bare-IP certificate** (no domain / DDNS);
   shared links change when the IP changes — accepted.
-- Router: can forward 443, 80 and UDP ranges, and **supports UPnP**.
+- Router: owner's router can forward and supports UPnP, but hostip **must
+  also work without UPnP / port forwarding** → connectivity ladder + relay
+  mode (§5.3b).
 
 **Open**
 - None blocking. Requirements are ready for implementation (M1).
