@@ -143,6 +143,8 @@ pub struct PortSpec {
     pub access: AccessConfig,
     /// The app itself serves HTTPS (usually with its own self-signed certificate).
     pub upstream_tls: bool,
+    /// Cap on bytes per second sent to each visitor connection.
+    pub max_client_rate: Option<u64>,
 }
 
 impl PortSpec {
@@ -189,6 +191,7 @@ impl PortSpec {
             idle_timeout,
             access: AccessConfig::default(),
             upstream_tls: false,
+            max_client_rate: None,
         };
         if mode != Mode::Udp && spec.listen.is_none() {
             spec.listen = Some(spec.default_listen_port()?);
@@ -275,6 +278,10 @@ pub struct TlsSection {
     pub extra_sans: Vec<String>,
     /// Copy the served certificate to these files for other programs (e.g. a TURN server).
     pub export: Option<ExportSection>,
+    /// Serve this certificate chain (PEM) instead of a self-signed / Let's Encrypt one.
+    pub cert: Option<PathBuf>,
+    /// Private key (PEM) for `cert`.
+    pub key: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -353,6 +360,8 @@ pub struct PortEntry {
     /// The app serves HTTPS itself; hostip connects to it over TLS (HTTP ports only).
     #[serde(default)]
     pub upstream_tls: bool,
+    /// Limit each visitor connection's download speed, e.g. `8mbit` or `1MB`.
+    pub max_client_rate: Option<String>,
 }
 
 /// A port written either as a TOML integer (`3000`) or string (`"50000-60000"`).
@@ -388,6 +397,11 @@ impl PortEntry {
             idle,
         )?;
         spec.upstream_tls = self.upstream_tls;
+        spec.max_client_rate = self
+            .max_client_rate
+            .as_deref()
+            .map(crate::io::parse_rate)
+            .transpose()?;
         spec.access = AccessConfig {
             allow: self.allow.clone(),
             deny: self.deny.clone(),
@@ -449,6 +463,9 @@ pub fn validate_specs(specs: &[PortSpec]) -> Result<()> {
                 "port {}: `upstream_tls` needs mode auto or https (use tcp mode to pass TLS through)",
                 a.public
             );
+        }
+        if a.mode == Mode::Udp && a.max_client_rate.is_some() {
+            bail!("port {}: `max_client_rate` does not apply to udp", a.public);
         }
         if a.mode == Mode::Udp && a.access != AccessConfig::default() {
             bail!(

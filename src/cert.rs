@@ -221,6 +221,44 @@ pub fn certified_key_from_pem(chain_pem: &str, key_pem: &str) -> Result<Certifie
     Ok(CertifiedKey::new(certs, any_supported_type(&key)?))
 }
 
+/// Reloads a user-supplied certificate whenever its files change (e.g. after an
+/// external renewal), checking every 30 seconds.
+pub async fn watch_files(
+    certs: Arc<CertStore>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut last = (modified(&cert_path), modified(&key_path));
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+        }
+        let now = (modified(&cert_path), modified(&key_path));
+        if now == last {
+            continue;
+        }
+        last = now;
+        let loaded = (|| -> Result<(CertifiedKey, PemPair)> {
+            let pem = PemPair {
+                chain: std::fs::read_to_string(&cert_path)?,
+                key: std::fs::read_to_string(&key_path)?,
+            };
+            Ok((certified_key_from_pem(&pem.chain, &pem.key)?, pem))
+        })();
+        match loaded {
+            Ok((key, pem)) => {
+                certs.replace_with_pem(key, pem);
+                tracing::info!("reloaded the certificate from {}", cert_path.display());
+            }
+            // Often a half-written pair during renewal; the next check picks it up.
+            Err(e) => tracing::warn!("cannot reload {}: {e:#}", cert_path.display()),
+        }
+    }
+}
+
 /// Builds a rustls signing key from PEM files.
 pub fn load_pem(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
     let certs = CertificateDer::pem_file_iter(cert_path)
@@ -272,6 +310,32 @@ mod tests {
             "subset of names must reuse the certificate"
         );
         assert_eq!(second.sans, sans(&["203.0.113.7", "localhost"]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reloads_user_certificate_files() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (key_a, info_a) = load_or_generate(a.path(), &sans(&["a.example"])).unwrap();
+        let (_, info_b) = load_or_generate(b.path(), &sans(&["b.example"])).unwrap();
+        let store = CertStore::new(key_a);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(watch_files(
+            store.clone(),
+            info_a.cert_path.clone(),
+            info_a.key_path.clone(),
+            shutdown.clone(),
+        ));
+        tokio::task::yield_now().await;
+        std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtimes
+        std::fs::copy(&info_b.cert_path, &info_a.cert_path).unwrap();
+        std::fs::copy(&info_b.key_path, &info_a.key_path).unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store.current_pem().unwrap().chain,
+            std::fs::read_to_string(&info_b.cert_path).unwrap()
+        );
+        shutdown.cancel();
     }
 
     #[test]

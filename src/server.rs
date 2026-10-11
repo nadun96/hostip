@@ -29,7 +29,7 @@ use crate::access::{AccessRules, Guard, Limits};
 use crate::acme::HttpChallenges;
 use crate::cert::{ACME_TLS_ALPN, CertStore};
 use crate::config::{Mode, PortSpec};
-use crate::io::{Activity, Prefixed};
+use crate::io::{Activity, Prefixed, Throttled};
 use crate::proxy::{Hold, HttpProxy};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -335,6 +335,21 @@ fn admit(ctx: &PortCtx, peer: SocketAddr) -> Option<Hold> {
 }
 
 async fn handle_connection<S: Io>(
+    ctx: Arc<PortCtx>,
+    stream: S,
+    peer: SocketAddr,
+    shutdown: CancellationToken,
+    hold: Hold,
+) {
+    match ctx.spec.max_client_rate {
+        Some(rate) => {
+            serve_connection(ctx, Throttled::new(stream, rate), peer, shutdown, hold).await
+        }
+        None => serve_connection(ctx, stream, peer, shutdown, hold).await,
+    }
+}
+
+async fn serve_connection<S: Io>(
     ctx: Arc<PortCtx>,
     stream: S,
     peer: SocketAddr,
