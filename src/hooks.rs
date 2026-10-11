@@ -34,11 +34,16 @@ pub struct CertExport {
 
 /// Runs `command` through the system shell with extra environment variables.
 pub async fn run_hook(command: &str, env: &[(&str, String)]) -> Result<()> {
-    let mut cmd = if cfg!(windows) {
+    #[cfg(windows)]
+    let mut cmd = {
+        // cmd.exe parses its own command line; Rust's argument quoting (\") would
+        // mangle commands that contain quotes, so pass it through untouched.
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
+        c.arg("/C").raw_arg(command);
         c
-    } else {
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
         let mut c = Command::new("sh");
         c.arg("-c").arg(command);
         c

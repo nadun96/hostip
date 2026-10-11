@@ -246,4 +246,11 @@ Let's Encrypt's test CA, and are skipped unless it is installed:
 go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1
 ```
 
+On Linux the Windows build can be checked and tested with MinGW and Wine:
+
+```
+rustup target add x86_64-pc-windows-gnu      # plus gcc-mingw-w64-x86-64 and wine64
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine64 cargo test --target x86_64-pc-windows-gnu
+```
+
 Logging is controlled with `RUST_LOG`, e.g. `RUST_LOG=hostip=debug`.
