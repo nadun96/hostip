@@ -18,7 +18,11 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 ### Goals
 - Expose one or more local HTTP(S)/WebSocket apps on the public IP with zero
   external services.
-- Generate and manage a self-signed certificate (or a local CA) automatically.
+- Serve apps to **other people (the public), not just the owner** — so the
+  default certificate must be one their browsers trust without warnings.
+- Obtain and renew a browser-trusted certificate automatically (ACME / Let's
+  Encrypt), with a self-signed certificate (or local CA) as the offline /
+  fallback mode.
 - Be safe by default: nothing is exposed unless explicitly configured, and
   optional authentication is easy to turn on.
 - Single static binary for Linux, macOS and Windows.
@@ -37,8 +41,8 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 | F1 | Listen for HTTPS on a configurable address/port (default `0.0.0.0:443`, fallback `8443`). | Must |
 | F2 | Reverse-proxy HTTP/1.1 requests to configured local upstreams (`http://127.0.0.1:<port>`). | Must |
 | F3 | Support multiple apps, routed by **port**, **path prefix**, or **hostname** (see §5.2). | Must |
-| F4 | On first run, generate a certificate with the public IP (and LAN IP, `localhost`) as `iPAddress`/`dNSName` SANs; persist key + cert to disk. | Must |
-| F5 | Optional "local CA" mode: generate a root CA once, sign leaf certs with it, and print instructions to install the CA on client devices so browsers stop warning. | Should |
+| F4 | Self-signed fallback: on first run, generate a certificate with the public IP (and LAN IP, `localhost`) as `iPAddress`/`dNSName` SANs; persist key + cert to disk. | Must |
+| F5 | Optional "local CA" mode: generate a root CA once, sign leaf certs with it, and print instructions to install the CA on client devices so browsers stop warning. Useful for testing/private use only — not a solution for public visitors. | Could |
 | F6 | Allow user-supplied cert/key (PEM) instead of generating. | Should |
 | F7 | Detect the public IP (via HTTPS echo services, configurable) and regenerate the leaf cert when it changes. | Should |
 | F8 | WebSocket upgrade passthrough (needed by Vite/Next.js HMR, Jupyter, etc.). | Must |
@@ -50,6 +54,8 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 | F14 | CLI: `hostip up`, `hostip add <name> <port>`, `hostip cert {show,regen,export-ca}`, `hostip status`. Quick mode: `hostip 3000`. | Must |
 | F15 | Config file (TOML) with hot reload of routes. | Should |
 | F16 | Graceful shutdown (drain in-flight requests on Ctrl-C/SIGTERM). | Must |
+| F17 | **ACME mode (default when the port is publicly reachable):** obtain a browser-trusted certificate from Let's Encrypt for (a) the bare public IP (short-lived profile) and/or (b) an `sslip.io` hostname for that IP; renew automatically; fall back to self-signed on failure and say so loudly. | Must |
+| F18 | Print a ready-to-share URL on start (e.g. `https://<ip-dashed>.sslip.io:8443`) and a QR code for phones. | Should |
 
 ## 3. Security requirements
 
@@ -122,6 +128,12 @@ production scale.
 
 ### 5.3 Network — **Feasible on most home connections, blocked on some**
 
+> **Owner's environment:** confirmed *not* behind CGNAT — the public IP is
+> directly reachable, so inbound hosting works once the port is forwarded /
+> opened in the firewall. (If hostip will run on a cloud VM rather than a home
+> PC, there is no NAT at all; only the provider's firewall / security group
+> and the OS firewall need the port opened.)
+
 | Situation | Outcome |
 |-----------|---------|
 | Router with public WAN IP, port forwarding allowed | ✅ Works (manual forward or UPnP) |
@@ -134,7 +146,14 @@ production scale.
 The F13 self-test should detect CGNAT (router WAN IP in `100.64.0.0/10` or
 differs from the observed public IP) and tell the user clearly.
 
-### 5.4 Self-signed TLS — **Feasible, with UX caveats**
+### 5.4 TLS — **self-signed is not enough for public visitors; ACME is required**
+
+Because the app will be used by **other people**, a plain self-signed
+certificate is not acceptable as the primary mode: every visitor gets a
+full-page "Your connection is not private" interstitial, many will (rightly)
+leave, and you can't ask strangers to install your root CA. Self-signed/local
+CA stays as the fallback and offline/testing mode; **ACME (F17) moves from v2
+into the v1 MVP.**
 
 - Encryption works fine, but **browsers will show "Not secure / Your connection
   is not private"** for a plain self-signed cert. Users must click through,
@@ -146,12 +165,27 @@ differs from the observed public IP) and tell the user clearly.
 - The cert **must** put the IP in a SAN of type `iPAddress`; browsers ignore
   the Common Name.
 - Keep leaf validity ≤ 397 days (Apple/Chrome limits) and auto-renew.
-- **Better alternative worth adding later:** Let's Encrypt now issues
-  short-lived certificates for IP addresses, and certs for `sslip.io`-style
-  hostnames have long been possible. An optional ACME mode (`instant-acme`
-  crate, HTTP-01 / TLS-ALPN-01 challenge) would give browser-trusted certs
-  with no warnings, provided port 80 or 443 is reachable. Check the current
-  CA policy before implementing.
+- **Trusted-cert options (in order of recommendation):**
+  1. **Let's Encrypt cert for an `sslip.io` hostname**
+     (`203-0-113-7.sslip.io`, resolves to `203.0.113.7`). Standard 90-day
+     cert, renewed ~30 days before expiry. Also gives hostname routing
+     (§5.2) and a friendlier URL. Caveat: sslip.io is a shared domain, so
+     Let's Encrypt's per-registered-domain rate limits may bite; fall back to
+     option 2 or a user-owned domain.
+  2. **Let's Encrypt cert for the bare IP** using the short-lived (~6-day)
+     profile. No third-party DNS at all, but renewal must run every few days
+     and failures surface fast — monitoring and retry are essential.
+  3. **User-owned domain** (A record → public IP, optional DDNS): most robust
+     for long-term public hosting.
+- **ACME implementation:** `instant-acme` crate; **TLS-ALPN-01** challenge
+  (works on port 443 only, no port 80 needed) or **HTTP-01** (needs port 80).
+  IP certificates can't use DNS-01. Store account key + certs on disk, hot-swap
+  the cert in rustls without restarting (`ResolvesServerCert`).
+- **Hard requirement for ACME:** Let's Encrypt validates on **port 443
+  (TLS-ALPN-01) or port 80 (HTTP-01)** — a high port like 8443 alone is not
+  enough. If the ISP blocks both, ACME is impossible and only self-signed or a
+  user-owned domain with DNS-01 remains. Verify the current Let's Encrypt
+  IP-certificate policy before implementing.
 
 ### 5.5 Security / operational — **Feasible, needs care**
 
@@ -179,10 +213,10 @@ project for async Rust and TLS.
 | Dimension | Rating |
 |-----------|--------|
 | Technical | ✅ High — mature crates, well-understood problem |
-| Network | ⚠️ Medium — works unless the user is behind CGNAT |
-| UX of self-signed TLS | ⚠️ Medium — warnings unless local CA or ACME is used |
+| Network | ✅ High for the owner (not behind CGNAT); ⚠️ for other users of the tool behind CGNAT |
+| Trusted TLS for public visitors | ✅ High with ACME (needs port 443 or 80 reachable); ❌ not achievable with self-signed alone |
 | Security | ⚠️ Medium — manageable with the defaults above |
-| **Overall** | **Feasible.** Ship port-based routing + self-signed/local-CA first; add sslip.io hostnames and ACME next. |
+| **Overall** | **Feasible.** Ship port-based routing + ACME (sslip.io hostname / IP cert) + self-signed fallback in v1; add hostname routing on one port next. |
 
 ---
 
@@ -192,7 +226,9 @@ project for async Rust and TLS.
 |------|-----------|--------|------------|
 | User is behind CGNAT | Medium | High | Detect and explain (F13); v2 relay mode |
 | Exposed dev server gets exploited | Medium | High | Auth on by default, loopback-only upstreams, warnings |
-| Browser warnings make it unusable for others | High | Medium | Local CA mode; ACME mode later |
+| Browser warnings make it unusable for others | High (self-signed) | High | ACME by default (F17); self-signed only as fallback |
+| ACME challenge fails (ports 80/443 blocked, rate limits) | Medium | High | TLS-ALPN-01 on 443, HTTP-01 fallback, clear diagnostics, self-signed fallback, own-domain option |
+| Short-lived IP cert expires (renewal outage) | Medium | High | Renew at ~half lifetime, retry with backoff, alert in logs/status |
 | Public IP changes break links/cert | Medium | Medium | IP watcher + cert regen; sslip.io hostnames |
 | UPnP unavailable/disabled | High | Low | Manual port-forward instructions printed by CLI |
 | ISP ToS forbid hosting | Low | Medium | Document; user's responsibility |
@@ -204,12 +240,13 @@ project for async Rust and TLS.
 | Phase | Scope | Estimate |
 |-------|-------|----------|
 | **M1 — MVP** | CLI quick mode, TOML config, port-based routing, self-signed cert with IP SANs, HTTP/1.1 + WebSocket proxy, forwarded headers, graceful shutdown | 1–2 weeks |
+| **M1.5 — Trusted TLS** | ACME (TLS-ALPN-01 + HTTP-01) for sslip.io hostname and bare IP, auto-renew with cert hot-swap, share URL output | ~1 week |
 | **M2 — Safe by default** | Basic/token auth, rate limiting, timeouts/limits, IP allow/deny, access logs, key file permissions | 1 week |
-| **M3 — Convenience** | Local CA mode + export, public-IP watcher + cert regen, reachability/CGNAT self-test, UPnP/NAT-PMP, HTTP/2, path routing, hot reload | 1–2 weeks |
+| **M3 — Convenience** | Local CA mode + export, sslip.io hostname routing on one port, public-IP watcher + cert regen, reachability/CGNAT self-test, UPnP/NAT-PMP, HTTP/2, path routing, hot reload | 1–2 weeks |
 | **M4 — Distribution** | Cross-platform CI, release binaries, docs, integration tests | ~1 week |
-| **v2 (optional)** | sslip.io hostname routing, ACME (trusted certs), IPv6, VPS relay for CGNAT, web dashboard | 2–4 weeks |
+| **v2 (optional)** | IPv6, VPS relay for CGNAT, web dashboard | 2–4 weeks |
 
-**MVP to usable v1: ~4–6 weeks part-time-equivalent of focused work.**
+**Usable public v1: ~5–7 weeks of focused work.**
 
 ---
 
@@ -217,13 +254,15 @@ project for async Rust and TLS.
 
 ```toml
 [server]
-listen = "0.0.0.0:8443"
-redirect_http = false          # listen on :80 and redirect
+listen = "0.0.0.0:443"         # 443 needed for ACME TLS-ALPN-01
+redirect_http = true           # listen on :80: HTTP-01 challenges + redirect
 
 [tls]
-mode = "local-ca"              # "self-signed" | "local-ca" | "files" | "acme" (v2)
+mode = "acme"                  # "acme" | "self-signed" | "local-ca" | "files"
 dir = "~/.hostip/certs"
-extra_sans = ["myhost.example"]
+acme_identifiers = ["sslip", "ip"]   # sslip.io hostname and/or bare public IP
+acme_email = "you@example.com"
+fallback = "self-signed"       # used if ACME fails; logged as a warning
 
 [network]
 upnp = true
@@ -232,7 +271,7 @@ public_ip_sources = ["https://api.ipify.org", "https://ifconfig.me/ip"]
 [[app]]
 name = "web"
 upstream = "http://127.0.0.1:3000"
-route = { port = 8443 }
+route = { port = 443 }
 auth = { basic = { user = "me", password_hash = "$argon2id$..." } }
 
 [[app]]
@@ -242,11 +281,18 @@ route = { path = "/api" }
 allow = ["203.0.113.0/24"]
 ```
 
-## 9. Open questions
+## 9. Decisions and open questions
 
-1. Is the audience only you and your own devices (→ local CA is fine), or the
-   public (→ ACME / trusted certs become important)?
-2. Do you need raw TCP (SSH, databases, game servers) or only HTTP(S)?
-3. Is your connection behind CGNAT? (Compare your router's WAN IP with
-   `curl https://api.ipify.org`.)
-4. Should hostip run as a background service (systemd / Windows service) in v1?
+**Decided**
+- Audience: **other people / the public**, not just the owner → ACME trusted
+  certs are a v1 requirement; self-signed is fallback only.
+- Owner's connection is **not behind CGNAT** → direct inbound hosting is
+  feasible; no relay needed for the owner.
+
+**Open**
+1. Do you need raw TCP (SSH, databases, game servers) or only HTTP(S)?
+2. Can ports 443 and/or 80 be opened (router forward, ISP not blocking)?
+   Required for Let's Encrypt validation.
+3. Is the host a home PC or a cloud VM? (Affects NAT/UPnP vs. security-group setup.)
+4. Is a free shared hostname (sslip.io) acceptable, or will you buy a domain?
+5. Should hostip run as a background service (systemd / Windows service) in v1?
