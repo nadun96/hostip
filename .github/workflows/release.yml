@@ -90,7 +90,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      # hostip and the Hop desktop app (hop-gui).
+      - run: cargo build --workspace --release --locked --target ${{ matrix.target }}
 
       - name: Find signtool and load the certificate
         if: runner.os == 'Windows' && env.WINDOWS_CERT_PFX != ''
@@ -100,13 +101,14 @@ jobs:
             Sort-Object FullName -Descending | Select-Object -First 1
           "SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
-      - name: Sign hostip.exe
+      - name: Sign hostip.exe and hop-gui.exe
         if: runner.os == 'Windows' && env.WINDOWS_CERT_PFX != ''
         shell: pwsh
         run: >
           & $env:SIGNTOOL sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:WINDOWS_CERT_PASSWORD
           /fd SHA256 /tr http://timestamp.digicert.com /td SHA256
           "target\${{ matrix.target }}\release\hostip.exe"
+          "target\${{ matrix.target }}\release\hop-gui.exe"
 
       - name: Package
         shell: bash
@@ -115,11 +117,13 @@ jobs:
           mkdir "$name"
           cp README.md LICENSE examples/hostip.toml "$name/"
           if [ "${{ matrix.archive }}" = zip ]; then
-            cp "target/${{ matrix.target }}/release/hostip.exe" "$name/"
+            cp "target/${{ matrix.target }}/release/hostip.exe" \
+               "target/${{ matrix.target }}/release/hop-gui.exe" "$name/"
             7z a "$name.zip" "$name" > /dev/null
             sha256sum "$name.zip" > "$name.zip.sha256"
           else
-            cp "target/${{ matrix.target }}/release/hostip" "$name/"
+            cp "target/${{ matrix.target }}/release/hostip" \
+               "target/${{ matrix.target }}/release/hop-gui" "$name/"
             tar czf "$name.tar.gz" "$name"
             shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           fi
@@ -132,6 +136,7 @@ jobs:
           wix build packaging/windows/hostip.wxs -arch x64 \
             -d "Version=${VERSION#v}" \
             -d "Bin=target/${{ matrix.target }}/release/hostip.exe" \
+            -d "Gui=target/${{ matrix.target }}/release/hop-gui.exe" \
             -o "hostip-${VERSION}-x86_64.msi"
       - name: Sign the MSI
         if: runner.os == 'Windows' && env.WINDOWS_CERT_PFX != ''

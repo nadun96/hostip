@@ -1,0 +1,18 @@
+[package]
+name = "hop-gui"
+version = "0.1.0"
+edition = "2024"
+description = "Hop: desktop app to publish local apps on your public IP with hostip"
+repository = "https://github.com/nadun96/hostip"
+license = "MIT"
+
+[[bin]]
+name = "hop-gui"
+path = "src/main.rs"
+
+[dependencies]
+# OpenGL (glow) rather than wgpu: smaller, and runs on older PCs and virtual displays.
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "glow", "links", "wayland", "x11"] }
+hostip = { path = ".." }
+qrcode = { version = "0.14.1", default-features = false }
+time = "0.3.55"
