@@ -2,7 +2,7 @@
   Windows installer for Hop (hostip), built with the WiX Toolset v5 by the
   Release workflow:
 
-    wix build packaging/windows/hostip.wxs -arch x64 -d Version=0.1.0 -d Bin=path\to\hostip.exe
+    wix build packaging/windows/hostip.wxs -arch x64 -d Version=0.1.1 -d Bin=path\to\hostip.exe
       -d Gui=path\to\hop-gui.exe -o hostip.msi
 
   Installs hostip.exe and the Hop desktop app (hop-gui.exe, with a Start menu

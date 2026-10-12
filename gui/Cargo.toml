@@ -1,6 +1,6 @@
 [package]
 name = "hop-gui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Hop: desktop app to publish local apps on your public IP with hostip"
 repository = "https://github.com/nadun96/hostip"
