@@ -27,17 +27,24 @@
           <Environment Id="AddToPath" Name="PATH" Value="[INSTALLFOLDER]"
               Action="set" Part="last" System="yes" Permanent="no" />
         </Component>
-        <Component Id="Docs">
+        <!-- One file per component: WiX derives component GUIDs only for those. -->
+        <Component Id="Readme">
           <File Id="Readme" Source="README.md" KeyPath="yes" />
-          <File Id="License" Source="LICENSE" Name="LICENSE.txt" />
-          <File Id="ExampleConfig" Source="examples/hostip.toml" Name="hostip.example.toml" />
+        </Component>
+        <Component Id="License">
+          <File Id="License" Source="LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+        </Component>
+        <Component Id="ExampleConfig">
+          <File Id="ExampleConfig" Source="examples/hostip.toml" Name="hostip.example.toml" KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
 
     <Feature Id="Main" Title="Hop">
       <ComponentRef Id="Binary" />
-      <ComponentRef Id="Docs" />
+      <ComponentRef Id="Readme" />
+      <ComponentRef Id="License" />
+      <ComponentRef Id="ExampleConfig" />
     </Feature>
   </Package>
 </Wix>
