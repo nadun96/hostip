@@ -20,11 +20,20 @@ flowchart LR
 | `test` | the pipeline only | end-to-end smoke tests with test data (`pipeline.yml`, job `smoke`) | `main`, automatically |
 | `main` | the pipeline only | — (release tags `v*` are cut from here, `release.yml`) | — |
 
-Promotions are **fast-forward only** (`scripts/promote.sh`): `test` and `main` are
-moved to the exact commit that was tested, never merged or rebased. If `main` or
-`test` has a commit that `dev` does not (someone committed there directly), the
-promotion stops with an error instead of overwriting it; merge that branch into
-`dev` and the flow continues.
+Promotions (`scripts/promote.sh`) leave `test` and `main` holding **exactly the
+tested content**, and never force-push:
+
+- usually `test`/`main` are simply fast-forwarded to the tested commit;
+- if the branch already has that content (e.g. you merged a `dev → test` pull
+  request by hand), there is nothing to do;
+- if the branch only has extra merge commits that add nothing (left by such
+  hand-merged pull requests), a merge commit with the tested content is added
+  on top.
+
+If `main` or `test` has changes that `dev` does not (someone committed there
+directly), the promotion stops with an error instead of overwriting them; merge
+that branch into `dev` and the flow continues. Promoting by hand with pull
+requests is fine, but not needed: the pipeline does it.
 
 ## Working on a feature
 
@@ -66,80 +75,115 @@ cargo build --release && tests/smoke/run.sh
 the same `promote.sh` the pipeline uses. A toy app is tested against rows of
 test data in `cases.csv` (`operation,a,b,expected`): one feature passes and
 reaches `main`; a second has a bug that the test data catches, so it stops at
-`dev` until a fix arrives; finally a commit made directly on `main` shows the
-fast-forward guard. Run it with `scripts/demo-flow.sh`; its output:
+`dev` until a fix arrives; then a `dev → test` pull request merged by hand shows
+the flow carrying on; finally a commit made directly on `main` shows the guard. Run it with `scripts/demo-flow.sh`; its output:
 
 ```text
 == Start: main, test and dev at the same commit
-   main  3e8a72e app: add
-   test  3e8a72e app: add
-   dev   3e8a72e app: add
+   main  fc8e1cb app: add
+   test  fc8e1cb app: add
+   dev   fc8e1cb app: add
 
 == Feature 1 (good): feature/multiply adds an operation and its test data
 -- pull request feature/multiply -> dev is reviewed and merged
-   main  3e8a72e app: add
-   test  3e8a72e app: add
-   dev   3e70ac0 Merge feature/multiply
--- tests on dev (3e70ac0)
+   main  fc8e1cb app: add
+   test  fc8e1cb app: add
+   dev   f129a47 Merge feature/multiply
+-- tests on dev (f129a47)
    pass  add 2 3 = 5
    pass  add -4 4 = 0
    pass  mul 6 7 = 42
    pass  mul -3 5 = -15
-   promoted test: 3e8a72e -> 3e70ac0
--- tests on test (3e70ac0)
+   promoted test: fc8e1cb -> f129a47
+-- tests on test (f129a47)
    pass  add 2 3 = 5
    pass  add -4 4 = 0
    pass  mul 6 7 = 42
    pass  mul -3 5 = -15
-   promoted main: 3e8a72e -> 3e70ac0
-   main  3e70ac0 Merge feature/multiply
-   test  3e70ac0 Merge feature/multiply
-   dev   3e70ac0 Merge feature/multiply
+   promoted main: fc8e1cb -> f129a47
+   main  f129a47 Merge feature/multiply
+   test  f129a47 Merge feature/multiply
+   dev   f129a47 Merge feature/multiply
 
 == Feature 2 (broken): feature/subtract has a bug the test data catches
 -- merged into dev
--- tests on dev (e36cc4f)
+-- tests on dev (2769d14)
    pass  add 2 3 = 5
    pass  add -4 4 = 0
    pass  mul 6 7 = 42
    pass  mul -3 5 = -15
    FAIL  sub 10 4: expected 6, got 14
    tests failed: test stays where it was
-   main  3e70ac0 Merge feature/multiply
-   test  3e70ac0 Merge feature/multiply
-   dev   e36cc4f Merge feature/subtract
+   main  f129a47 Merge feature/multiply
+   test  f129a47 Merge feature/multiply
+   dev   2769d14 Merge feature/subtract
    main still has only tested code.
 
 == Fix: a new commit on dev, and the flow continues
--- tests on dev (dc4a928)
+-- tests on dev (b4ee667)
    pass  add 2 3 = 5
    pass  add -4 4 = 0
    pass  mul 6 7 = 42
    pass  mul -3 5 = -15
    pass  sub 10 4 = 6
-   promoted test: 3e70ac0 -> dc4a928
--- tests on test (dc4a928)
+   promoted test: f129a47 -> b4ee667
+-- tests on test (b4ee667)
    pass  add 2 3 = 5
    pass  add -4 4 = 0
    pass  mul 6 7 = 42
    pass  mul -3 5 = -15
    pass  sub 10 4 = 6
-   promoted main: 3e70ac0 -> dc4a928
-   main  dc4a928 app: fix subtract
-   test  dc4a928 app: fix subtract
-   dev   dc4a928 app: fix subtract
+   promoted main: f129a47 -> b4ee667
+   main  b4ee667 app: fix subtract
+   test  b4ee667 app: fix subtract
+   dev   b4ee667 app: fix subtract
+
+== Promoted by hand: a dev -> test pull request merged on GitHub adds a merge commit
+   main  b4ee667 app: fix subtract
+   test  908ed72 Merge pull request: dev -> test
+   dev   512e72a more test data
+-- tests on test (908ed72)
+   pass  add 2 3 = 5
+   pass  add -4 4 = 0
+   pass  mul 6 7 = 42
+   pass  mul -3 5 = -15
+   pass  sub 10 4 = 6
+   pass  add 100 1 = 101
+   promoted main: b4ee667 -> 908ed72
+-- the next feature: test now has a merge commit that dev lacks, but it adds nothing
+-- tests on dev (9fc9e23)
+   pass  add 2 3 = 5
+   pass  add -4 4 = 0
+   pass  mul 6 7 = 42
+   pass  mul -3 5 = -15
+   pass  sub 10 4 = 6
+   pass  add 100 1 = 101
+   pass  mul 0 9 = 0
+   promoted test: 908ed72 -> 194164f (merge of 9fc9e23, tested content)
+-- tests on test (194164f)
+   pass  add 2 3 = 5
+   pass  add -4 4 = 0
+   pass  mul 6 7 = 42
+   pass  mul -3 5 = -15
+   pass  sub 10 4 = 6
+   pass  add 100 1 = 101
+   pass  mul 0 9 = 0
+   promoted main: 908ed72 -> 194164f
+   main  194164f Promote 9fc9e23 to test
+   test  194164f Promote 9fc9e23 to test
+   dev   9fc9e23 even more test data
 
 == Guard: a commit made directly on main is never overwritten
-   promoted test: dc4a928 -> 45f449a
-   ::error::main has commits that 45f449a does not contain; merge main into dev first (never commit to test or main directly).
+   promoted test: 194164f -> 6325fea (merge of 00d2168, tested content)
+   ::error::main has changes that 00d2168 does not contain; merge main into dev first (never commit to test or main directly).
    refused: merge main into dev, then the flow continues
 ```
 
 ## One-time setup on GitHub
 
-1. **Bring `dev` and `test` up to date with `main`.** The fast-forward rule needs
-   `main` ⊆ `test` ⊆ `dev`. Merge `main` into `dev` (a pull request from `main` to
-   `dev`); the next pipeline run then moves `test` and `main` forward.
+1. **Bring `dev` up to date with `main`.** `dev` must contain everything on
+   `test` and `main`. Merge `main` into `dev` once (a pull request from `main`
+   to `dev`); the next pipeline run then moves `test` and `main` forward.
 2. **Protect the branches** (Settings → Rules → Rulesets):
    - `dev`: require a pull request and the `CI` checks to pass.
    - `test`, `main`: block direct pushes for everyone except the pipeline.
