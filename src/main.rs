@@ -33,6 +33,21 @@ const CONFIG_POLL: Duration = Duration::from_secs(2);
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Log format: `text`, or `json` (one object per line on stderr, for log collectors).
+    #[arg(
+        long,
+        global = true,
+        env = "HOSTIP_LOG_FORMAT",
+        value_enum,
+        default_value_t = LogFormat::Text
+    )]
+    log_format: LogFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -195,19 +210,31 @@ struct ExposeArgs {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Command::Service(ServiceCommand::Run { config }) = cli.command {
-        return run_service(config);
+        return run_service(config, cli.log_format);
     }
-    init_console_logging();
+    init_logging(cli.log_format, None);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run(cli.command))
 }
 
-fn init_console_logging() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hostip=info")),
-        )
-        .init();
+/// Logs to the console, or to `file` (the Windows service log). JSON goes to
+/// stderr on the console so it never mixes with the summary printed on stdout.
+fn init_logging(format: LogFormat, file: Option<std::fs::File>) {
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hostip=info")),
+    );
+    match (format, file) {
+        (LogFormat::Json, Some(file)) => builder
+            .json()
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        (LogFormat::Json, None) => builder.json().with_writer(std::io::stderr).init(),
+        (LogFormat::Text, Some(file)) => builder
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        (LogFormat::Text, None) => builder.init(),
+    }
 }
 
 async fn run(command: Command) -> Result<()> {
@@ -372,18 +399,12 @@ fn uninstall_service() -> Result<()> {
 }
 
 #[cfg(windows)]
-fn run_service(config: PathBuf) -> Result<()> {
+fn run_service(config: PathBuf, log_format: LogFormat) -> Result<()> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(service::windows::log_path())?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hostip=info")),
-        )
-        .with_ansi(false)
-        .with_writer(std::sync::Mutex::new(log))
-        .init();
+    init_logging(log_format, Some(log));
     service::windows::run(config, |config, shutdown| {
         let args = ExposeArgs {
             config: Some(config),
@@ -437,7 +458,7 @@ fn uninstall_service() -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn run_service(_config: PathBuf) -> Result<()> {
+fn run_service(_config: PathBuf, _log_format: LogFormat) -> Result<()> {
     bail!("`hostip service run` is only used by Windows; on Linux the unit runs `hostip expose`")
 }
 

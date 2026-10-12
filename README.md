@@ -286,3 +286,6 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine64 cargo test --target x86_64-pc-w
 ```
 
 Logging is controlled with `RUST_LOG`, e.g. `RUST_LOG=hostip=debug`.
+`--log-format json` (or `HOSTIP_LOG_FORMAT=json`, which also reaches the
+systemd unit and the Windows service) writes one JSON object per line instead,
+on stderr, so the summary on stdout stays readable.
