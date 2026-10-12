@@ -533,16 +533,14 @@ protocol = "udp"
 | F2, F8, F11, F20–F22, F25, F33 | ✅ | `src/proxy.rs`: streamed bodies, upgrades (WebSocket), forwarded headers, redirect rewrite, no total timeout; tests in `tests/proxy.rs` |
 | F3, F30, F31, F34 | ✅ | Stack-agnostic port specs and modes (`src/config.rs`), HTTP sniffing in `auto` |
 | F4 | ✅ | Self-signed fallback with public/LAN IP SANs (`src/cert.rs`) |
-| F5 | ⬜ | Local CA mode — superseded in practice by Let's Encrypt IP certificates |
+| F5 | ✅ | `--local-ca` / `[tls] local_ca = true`: a private CA created once (`<cert-dir>/local-ca`, key 0600) signs the fallback certificate; `hostip cert export-ca` writes it and prints install steps for Windows, macOS, Linux, Firefox, Android and iOS (`src/cert.rs`; tests validate the chain with rustls' WebPKI verifier) |
 | F6 | ✅ | `--cert/--key` or `[tls] cert/key`, reloaded when the files change |
 | F7, F19 | ✅ | IP watcher with confirmation and address-family stickiness; re-issue on change (`src/publicip.rs`, `src/acme.rs`) |
 | F9 | ✅ | HTTP/2 via ALPN |
 | F10 | ✅ | Port-80 listener: ACME HTTP-01 + redirect to https |
 | F12, F26 | ✅ | UPnP-IGD with PCP/NAT-PMP fallback, leases renewed, removed on exit (`src/portmap.rs`; fake-router tests) |
-| F13, F29 | 🟡 | Double-NAT/CGNAT warning from the router's WAN address; Let's Encrypt validation proves 443/80 reachability. No independent outside probe yet |
-| F14 | ✅ | `expose`, `status`, `ip`, `cert`, `hash-password`, `service`, `relay`. `status` shows links, certificate expiry, the last Let's Encrypt result and next renewal, open connections; `--json`; exit code 1 when not running (`src/status.rs`) |
 | F13, F29 | ✅ | `hostip check`: a `hostip relay` probes the caller's own public IP from outside (TCP connect, UDP datagrams; temporary listeners and UPnP mappings for free ports); CGNAT / double NAT from the router's WAN address vs. the observed IP (`src/check.rs`; end-to-end tests in `tests/check.rs`). Needs a relay; no third-party probe |
-| F14 | ✅ | `expose`, `status`, `ip`, `cert`, `hash-password`, `service`, `relay` |
+| F14 | ✅ | `expose`, quick mode `hostip 3000` (generated login), `status` (links, certificate expiry, last Let's Encrypt result, open connections; `--json`; exit 1 when not running), `check`, `ip`, `cert` / `cert export-ca`, `hash-password`, `service`, `relay`. `up`/`add` are covered by `expose --config` and the hot-reloaded config file |
 | F15 | ✅ | Config file polled; valid changes restart the listeners in-process, invalid ones are rejected |
 | F16 | ✅ | Graceful shutdown with drain (Ctrl+C, SIGTERM, service stop) |
 | F17 | ✅ | Let's Encrypt bare-IP certificates, short-lived profile, TLS-ALPN-01 + HTTP-01 with rotation, renewal at ⅔ lifetime (`src/acme.rs`; Pebble tests) |

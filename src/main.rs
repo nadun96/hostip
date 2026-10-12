@@ -85,8 +85,21 @@ enum Command {
     Service(ServiceCommand),
     /// Show the stored certificate.
     Cert {
-        #[arg(long)]
+        #[arg(long, global = true)]
         cert_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<CertAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CertAction {
+    /// Write the local CA certificate (created if needed) and print how to
+    /// install it on devices, so they trust `--local-ca` certificates.
+    ExportCa {
+        /// Where to write it.
+        #[arg(long, default_value = "hop-local-ca.crt")]
+        out: PathBuf,
     },
 }
 
@@ -169,6 +182,10 @@ struct ExposeArgs {
     /// Where certificates are stored.
     #[arg(long)]
     cert_dir: Option<PathBuf>,
+    /// Sign the fallback certificate with a local CA that your devices can trust
+    /// (install it with `hostip cert export-ca`) instead of self-signing it.
+    #[arg(long)]
+    local_ca: bool,
     /// Extra names or IPs to include in the self-signed certificate.
     #[arg(long = "san")]
     sans: Vec<String>,
@@ -373,7 +390,38 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Service(ServiceCommand::Uninstall) => uninstall_service(),
         Command::Service(ServiceCommand::Run { .. }) => unreachable!("handled in main"),
-        Command::Cert { cert_dir } => {
+        Command::Cert {
+            cert_dir,
+            action: Some(CertAction::ExportCa { out }),
+        } => {
+            let dir = cert_dir.unwrap_or_else(default_cert_dir);
+            let (ca, created) = cert::LocalCa::load_or_create(&dir)?;
+            std::fs::write(&out, &ca.cert_pem)?;
+            println!(
+                "{} \"{}\" written to {}{}",
+                if created {
+                    "Created the local CA"
+                } else {
+                    "Local CA"
+                },
+                ca.name,
+                out.display(),
+                if created {
+                    "; start hostip with --local-ca (or [tls] local_ca = true) to use it"
+                } else {
+                    ""
+                }
+            );
+            println!(
+                "{}",
+                cert::CA_INSTALL_HELP.replace("{file}", &out.display().to_string())
+            );
+            Ok(())
+        }
+        Command::Cert {
+            cert_dir,
+            action: None,
+        } => {
             let dir = cert_dir.unwrap_or_else(default_cert_dir);
             match cert::stored_info(&dir) {
                 Some(info) => println!("{info}"),
@@ -695,12 +743,25 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
         .clone()
         .or(file.tls.dir.clone())
         .unwrap_or_else(default_cert_dir);
+    // Local-CA mode (F5): the fallback certificate is signed by a CA devices can install.
+    let local_ca = if args.local_ca || file.tls.local_ca {
+        let (ca, created) = cert::LocalCa::load_or_create(&cert_dir)?;
+        info!(
+            "{} local CA \"{}\" ({}); install it on your devices: hostip cert export-ca",
+            if created { "created" } else { "using" },
+            ca.name,
+            ca.cert_path.display()
+        );
+        Some(ca)
+    } else {
+        None
+    };
     let self_signed = {
-        let (cert_dir, base_sans) = (cert_dir.clone(), base_sans.clone());
+        let (cert_dir, base_sans, ca) = (cert_dir.clone(), base_sans.clone(), local_ca.clone());
         move |ip: Option<IpAddr>| {
             let mut sans = base_sans.clone();
             sans.extend(ip.map(|ip| ip.to_string()));
-            cert::load_or_generate(&cert_dir, &sans)
+            cert::load_or_generate_with(&cert_dir, &sans, ca.as_ref())
         }
     };
     let own_cert = match (&args.cert, &args.key) {
@@ -807,7 +868,10 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
         &host,
         lan_ip,
         http_bound,
-        acme_active,
+        CertSummary {
+            acme: acme_active,
+            local_ca: local_ca.as_ref().map(|ca| ca.name.as_str()),
+        },
         upnp,
         relay.as_ref().map(|r| r.address.as_str()),
     );
@@ -1044,15 +1108,24 @@ fn url_host(host: &str) -> String {
     }
 }
 
+/// What the startup summary says about the certificate.
+struct CertSummary<'a> {
+    /// Let's Encrypt is being requested.
+    acme: bool,
+    /// Name of the local CA signing the fallback certificate.
+    local_ca: Option<&'a str>,
+}
+
 fn print_summary(
     specs: &[PortSpec],
     host: &str,
     lan_ip: Option<IpAddr>,
     http_listen: Option<u16>,
-    acme: bool,
+    cert: CertSummary<'_>,
     upnp: bool,
     relay: Option<&str>,
 ) {
+    let CertSummary { acme, local_ca } = cert;
     let host = url_host(host);
     let pc = lan_ip.map_or_else(|| "this PC".to_owned(), |ip| ip.to_string());
     println!();
@@ -1118,9 +1191,15 @@ fn print_summary(
         );
     }
     println!();
+    let fallback = match local_ca {
+        Some(name) => format!("a certificate from your local CA \"{name}\""),
+        None => "a self-signed certificate".to_owned(),
+    };
     if acme {
+        println!("Serving {fallback} until Let's Encrypt issues the certificate for the IP.");
+    } else if local_ca.is_some() {
         println!(
-            "Serving a self-signed certificate until Let's Encrypt issues the certificate for the IP."
+            "Serving {fallback}: devices that installed it (`hostip cert export-ca`) trust it, others see a warning."
         );
     } else {
         println!("The certificate is self-signed, so browsers will show a warning.");
