@@ -12,6 +12,7 @@ use time::OffsetDateTime;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::acme;
 use crate::cert::CertStore;
 
 const WRITE_INTERVAL: Duration = Duration::from_secs(30);
@@ -27,6 +28,22 @@ pub struct Status {
     pub mode: String,
     pub urls: Vec<String>,
     pub certificate: Option<CertificateStatus>,
+    /// Latest Let's Encrypt attempt, when ACME is on.
+    #[serde(default)]
+    pub acme: Option<AcmeStatus>,
+    /// Visitor connections open right now.
+    #[serde(default)]
+    pub open_connections: usize,
+}
+
+/// Outcome of the latest Let's Encrypt attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AcmeStatus {
+    pub at: i64,
+    /// `None` on success.
+    pub error: Option<String>,
+    /// Next renewal or retry.
+    pub next: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -75,26 +92,40 @@ fn certificate_status(certs: &CertStore) -> Option<CertificateStatus> {
     })
 }
 
-/// Rewrites the status file every 30 seconds and whenever the IP or certificate
-/// changes; removes it on shutdown.
-pub async fn write_periodically(
-    file: PathBuf,
-    mode: String,
-    urls: impl Fn(Option<IpAddr>) -> Vec<String> + Send + 'static,
-    certs: Arc<CertStore>,
-    mut ip: watch::Receiver<Option<IpAddr>>,
-    shutdown: CancellationToken,
-) {
-    let mut cert_changes = certs.subscribe();
+/// What the status file reports, and where it comes from.
+pub struct Sources {
+    /// `direct` or `relay <address>`.
+    pub mode: String,
+    pub urls: Box<dyn Fn(Option<IpAddr>) -> Vec<String> + Send>,
+    pub certs: Arc<CertStore>,
+    pub ip: watch::Receiver<Option<IpAddr>>,
+    pub acme: Option<watch::Receiver<Option<acme::Outcome>>>,
+    pub open_connections: Box<dyn Fn() -> usize + Send>,
+}
+
+/// Rewrites the status file every 30 seconds and whenever the IP, the certificate
+/// or the Let's Encrypt state changes; removes it on shutdown.
+pub async fn write_periodically(file: PathBuf, mut src: Sources, shutdown: CancellationToken) {
+    let mut cert_changes = src.certs.subscribe();
+    let mut acme_rx = src.acme.take();
     loop {
-        let public_ip = *ip.borrow_and_update();
+        let public_ip = *src.ip.borrow_and_update();
+        let acme = acme_rx.as_mut().and_then(|rx| {
+            rx.borrow_and_update().as_ref().map(|o| AcmeStatus {
+                at: o.at.unix_timestamp(),
+                error: o.error.clone(),
+                next: o.next.unix_timestamp(),
+            })
+        });
         let status = Status {
             pid: std::process::id(),
             updated: OffsetDateTime::now_utc().unix_timestamp(),
             public_ip,
-            mode: mode.clone(),
-            urls: urls(public_ip),
-            certificate: certificate_status(&certs),
+            mode: src.mode.clone(),
+            urls: (src.urls)(public_ip),
+            certificate: certificate_status(&src.certs),
+            acme,
+            open_connections: (src.open_connections)(),
         };
         if let Ok(json) = serde_json::to_vec_pretty(&status) {
             if let Some(dir) = file.parent() {
@@ -105,14 +136,30 @@ pub async fn write_periodically(
                 let _ = std::fs::rename(&tmp, &file);
             }
         }
+        // A closed channel never changes again; it must not wake the loop.
+        let ip_changed = async {
+            if src.ip.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        let acme_changed = async {
+            let open = match acme_rx.as_mut() {
+                Some(rx) => rx.changed().await.is_ok(),
+                None => false,
+            };
+            if !open {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             _ = shutdown.cancelled() => {
                 let _ = std::fs::remove_file(&file);
                 return;
             }
             _ = tokio::time::sleep(WRITE_INTERVAL) => {}
-            _ = ip.changed() => {}
+            _ = ip_changed => {}
             _ = cert_changes.changed() => {}
+            _ = acme_changed => {}
         }
     }
 }
@@ -123,11 +170,17 @@ pub fn read(file: &Path) -> Result<Status> {
     Ok(serde_json::from_str(&text)?)
 }
 
+impl Status {
+    pub fn is_running(&self, now: i64) -> bool {
+        now - self.updated <= STALE_AFTER.as_secs() as i64
+    }
+}
+
 /// Human-readable report; `now` is passed in for testability.
 pub fn render(status: &Status, now: i64) -> String {
     let age = now - status.updated;
     let mut out = String::new();
-    if age > STALE_AFTER.as_secs() as i64 {
+    if !status.is_running(now) {
         out.push_str(&format!(
             "hostip is NOT running (last seen {} min ago, pid {})\n",
             age / 60,
@@ -158,7 +211,38 @@ pub fn render(status: &Status, now: i64) -> String {
             cert.subject, cert.issuer
         ));
     }
+    if let Some(acme) = &status.acme {
+        let at = datetime(acme.at);
+        let next = if acme.next > now {
+            format!(
+                "{} (in {:.1} days)",
+                datetime(acme.next),
+                days(acme.next - now)
+            )
+        } else {
+            "due now".to_owned()
+        };
+        match &acme.error {
+            None => out.push_str(&format!(
+                "Renewal:     last check {at} succeeded; next {next}\n"
+            )),
+            Some(e) => out.push_str(&format!("Renewal:     FAILED {at}: {e}; retry {next}\n")),
+        }
+    }
+    if status.is_running(now) {
+        out.push_str(&format!("Connections: {} open\n", status.open_connections));
+    }
     out
+}
+
+fn datetime(unix: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(unix)
+        .map(|t| t.to_string())
+        .unwrap_or_default()
+}
+
+fn days(secs: i64) -> f64 {
+    secs as f64 / 86_400.0
 }
 
 #[cfg(test)]
@@ -177,6 +261,12 @@ mod tests {
                 issuer: "CN=E8, O=Let's Encrypt".into(),
                 not_after: updated + 4 * 86_400,
             }),
+            acme: Some(AcmeStatus {
+                at: updated - 60,
+                error: None,
+                next: updated + 2 * 86_400,
+            }),
+            open_connections: 7,
         }
     }
 
@@ -190,8 +280,34 @@ mod tests {
         );
         assert!(running.contains("https://203.0.113.7"));
         assert!(running.contains("4.0 days"), "{running}");
+        assert!(running.contains("succeeded; next"), "{running}");
+        assert!(running.contains("Connections: 7 open"), "{running}");
         let stale = render(&sample(now - 600), now);
         assert!(stale.starts_with("hostip is NOT running"), "{stale}");
+        assert!(!stale.contains("Connections"), "{stale}");
+    }
+
+    #[test]
+    fn renders_a_failed_renewal() {
+        let now = 1_800_000_000;
+        let mut s = sample(now - 10);
+        s.acme = Some(AcmeStatus {
+            at: now - 60,
+            error: Some("connection refused".into()),
+            next: now + 600,
+        });
+        let text = render(&s, now);
+        assert!(text.contains("FAILED"), "{text}");
+        assert!(text.contains("connection refused; retry"), "{text}");
+    }
+
+    #[test]
+    fn reads_files_from_older_versions() {
+        // Written before `acme` and `open_connections` existed.
+        let old = r#"{"pid":1,"updated":5,"public_ip":null,"mode":"direct","urls":[],"certificate":null}"#;
+        let s: Status = serde_json::from_str(old).unwrap();
+        assert_eq!(s.acme, None);
+        assert_eq!(s.open_connections, 0);
     }
 
     #[tokio::test]
@@ -203,10 +319,14 @@ mod tests {
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(write_periodically(
             file.clone(),
-            "direct".into(),
-            |ip| vec![format!("https://{}", ip.unwrap())],
-            CertStore::new(key),
-            rx,
+            Sources {
+                mode: "direct".into(),
+                urls: Box::new(|ip| vec![format!("https://{}", ip.unwrap())]),
+                certs: CertStore::new(key),
+                ip: rx,
+                acme: None,
+                open_connections: Box::new(|| 3),
+            },
             shutdown.clone(),
         ));
         for _ in 0..50 {
@@ -218,6 +338,7 @@ mod tests {
         let status = read(&file).unwrap();
         assert_eq!(status.urls, ["https://203.0.113.7"]);
         assert_eq!(status.certificate.unwrap().subject, "203.0.113.7");
+        assert_eq!(status.open_connections, 3);
         shutdown.cancel();
         task.await.unwrap();
         assert!(!file.exists());
