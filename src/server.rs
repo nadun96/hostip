@@ -30,6 +30,7 @@ use crate::acme::HttpChallenges;
 use crate::cert::{ACME_TLS_ALPN, CertStore};
 use crate::config::{Mode, PortSpec};
 use crate::io::{Activity, Prefixed, Throttled};
+use crate::portowner;
 use crate::proxy::{Hold, HttpProxy};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -158,8 +159,12 @@ impl Server {
             let listen = spec
                 .listen_port()
                 .context("tcp port spec without listen port")?;
-            let listener = TcpListener::bind((bind, listen)).await.with_context(|| {
-                format!("cannot listen on {bind}:{listen} (is the port already in use?)")
+            let listener = TcpListener::bind((bind, listen)).await.map_err(|e| {
+                anyhow::anyhow!(portowner::describe_bind_error(
+                    &format!("{bind}:{listen}"),
+                    listen,
+                    &e
+                ))
             })?;
             let upstream = SocketAddr::from((Ipv4Addr::LOCALHOST, spec.local.start));
             let public_host = if public_host.contains(':') {
@@ -204,9 +209,12 @@ impl Server {
         challenges: Arc<HttpChallenges>,
         https_port: Option<u16>,
     ) -> Result<SocketAddr> {
-        let listener = TcpListener::bind((bind, port))
-            .await
-            .with_context(|| format!("cannot listen on {bind}:{port} for HTTP"))?;
+        let listener = TcpListener::bind((bind, port)).await.map_err(|e| {
+            anyhow::anyhow!(
+                "{} (plain HTTP)",
+                portowner::describe_bind_error(&format!("{bind}:{port}"), port, &e)
+            )
+        })?;
         let addr = listener.local_addr()?;
         let ctx = HttpPortCtx {
             challenges,
