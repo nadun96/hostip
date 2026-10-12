@@ -58,7 +58,6 @@ video conferencing server is in [`examples/hostip.toml`](examples/hostip.toml).
 
 ```
 hostip expose [PORTS]... [--config hostip.toml] [--public-ip IP] [--bind ADDR] [--cert-dir DIR]
-              [--cert FILE --key FILE]
               [--no-acme] [--acme-staging] [--acme-email EMAIL] [--http-listen PORT] [--no-upnp]
               [--auth USER:PASSWORD] [--allow CIDR]... [--max-connections N] [--access-log]
               [--ip-file FILE] [--on-ip-change CMD] [--export-cert FILE --export-key FILE]
@@ -95,16 +94,6 @@ accept the Let's Encrypt Subscriber Agreement. Try `--acme-staging` first while
 setting things up; staging certificates are not trusted by browsers but don't
 count against rate limits. Certificates and the ACME account live in
 `<cert-dir>/acme`.
-
-### Your own certificate
-
-To serve a certificate you already have (for a domain pointing at this PC, or
-from your own CA), pass `--cert chain.pem --key key.pem` or set `cert` and
-`key` under `[tls]`. Let's Encrypt and the self-signed certificate are then
-off. The files are checked every minute and reloaded when they change, so a
-renewal by certbot or similar is picked up without a restart; a broken update
-keeps the previous certificate in service. If the certificate does not cover
-the public IP, links use its first domain name.
 
 ### Apps that serve HTTPS themselves
 
