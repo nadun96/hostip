@@ -56,7 +56,12 @@ video conferencing server is in [`examples/hostip.toml`](examples/hostip.toml).
 
 ## Usage
 
+Quick mode: `hostip 3000` publishes port 3000 behind a generated login (user
+`hostip`, password printed once). `--auth user:password` picks your own,
+`--no-auth` leaves the links open; every `expose` option works too.
+
 ```
+hostip PORTS... [--no-auth | --auth USER:PASSWORD] [expose options]   # quick mode
 hostip expose [PORTS]... [--config hostip.toml] [--public-ip IP] [--bind ADDR] [--cert-dir DIR]
               [--no-acme] [--acme-staging] [--acme-email EMAIL] [--http-listen PORT] [--no-upnp]
               [--auth USER:PASSWORD] [--allow CIDR]... [--max-connections N] [--access-log]

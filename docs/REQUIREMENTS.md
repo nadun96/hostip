@@ -540,7 +540,7 @@ protocol = "udp"
 | F10 | ✅ | Port-80 listener: ACME HTTP-01 + redirect to https |
 | F12, F26 | ✅ | UPnP-IGD with PCP/NAT-PMP fallback, leases renewed, removed on exit (`src/portmap.rs`; fake-router tests) |
 | F13, F29 | 🟡 | Double-NAT/CGNAT warning from the router's WAN address; Let's Encrypt validation proves 443/80 reachability. No independent outside probe yet |
-| F14 | ✅ | `expose`, `status`, `ip`, `cert`, `hash-password`, `service`, `relay` |
+| F14 | ✅ | `expose`, `status`, `ip`, `cert`, `hash-password`, `service`, `relay`; quick mode `hostip 3000` (generated login). `up`/`add` are covered by `expose --config` and the hot-reloaded config file; `cert export-ca` belongs to F5 |
 | F15 | ✅ | Config file polled; valid changes restart the listeners in-process, invalid ones are rejected |
 | F16 | ✅ | Graceful shutdown with drain (Ctrl+C, SIGTERM, service stop) |
 | F17 | ✅ | Let's Encrypt bare-IP certificates, short-lived profile, TLS-ALPN-01 + HTTP-01 with rotation, renewal at ⅔ lifetime (`src/acme.rs`; Pebble tests) |
@@ -552,7 +552,7 @@ protocol = "udp"
 | F35, F36 | ✅ | Connectivity ladder: already reachable → UPnP → PCP/NAT-PMP → relay mode (`src/relay.rs`; end-to-end tests incl. UDP). IPv6-only path not specially handled |
 | S1 | ✅ | Upstreams are always 127.0.0.1 |
 | S2 | ✅ | rustls safe defaults (TLS 1.2/1.3) |
-| S3 | 🟡 | Basic auth + session cookie, Argon2; **opt-in** (`--auth`), not on by default — public conferencing links must work without a password prompt; the startup summary warns about open ports |
+| S3 | ✅ | Basic auth + session cookie, Argon2. On by default in quick mode (`hostip 3000`: generated password printed once, `--no-auth` to opt out); opt-in for `expose`, so public conferencing links work without a password prompt; the startup summary warns about open ports |
 | S4, S5, S8 | ✅ | `src/access.rs`: allow/deny, per-IP connection/rate limits, brute-force blocking, access log |
 | S6 | ✅ | Private keys 0600 on Unix; Windows data folder ACL set by the service installer |
 | S7 | ✅ | Hop-by-hop headers stripped; generic 502 text |
