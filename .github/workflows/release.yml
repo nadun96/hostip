@@ -1,19 +1,43 @@
 name: Release
 
-# Push a tag like v0.2.0 to build binaries for every platform and attach them to
-# a GitHub release (created as a draft so it can be reviewed before publishing).
+# Builds binaries for every platform and attaches them to a GitHub release,
+# created as a draft so it can be reviewed before publishing. Start it either by
+# pushing a tag like v0.2.0, or with "Run workflow" on main (Actions -> Release),
+# which creates the tag itself.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to create, e.g. v0.2.0 (must match Cargo.toml)"
+        required: true
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  VERSION: ${{ inputs.version || github.ref_name }}
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release only from main, with the version in Cargo.toml
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::run the release from main, not $GITHUB_REF_NAME"; exit 1
+          fi
+          cargo_version="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$VERSION" != "$cargo_version" ]; then
+            echo "::error::version $VERSION does not match Cargo.toml ($cargo_version)"; exit 1
+          fi
+
   build:
+    needs: check
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +70,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          name="hostip-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="hostip-${VERSION}-${{ matrix.target }}"
           mkdir "$name"
           cp README.md LICENSE examples/hostip.toml "$name/"
           if [ "${{ matrix.archive }}" = zip ]; then
@@ -72,6 +96,9 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          # From "Run workflow" this creates the tag on the commit that was built.
+          tag_name: ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
           draft: true
           generate_release_notes: true
           files: hostip-*
