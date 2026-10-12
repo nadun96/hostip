@@ -310,6 +310,10 @@ cargo build --release
 cargo test
 ```
 
+`cargo bench --bench e2e` measures the real binary against the performance
+targets in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) §4 (requests per second,
+added latency, streaming throughput, memory, startup) and fails if one is missed.
+
 The ACME tests issue real certificates from [Pebble](https://github.com/letsencrypt/pebble),
 Let's Encrypt's test CA, and are skipped unless it is installed:
 
