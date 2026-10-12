@@ -3,7 +3,7 @@ members = [".", "gui"]
 
 [package]
 name = "hostip"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Publish local apps on your public IP over HTTPS, with Let's Encrypt IP certificates"
 repository = "https://github.com/nadun96/hostip"

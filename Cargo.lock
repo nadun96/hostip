@@ -1743,7 +1743,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hop-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "hostip",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "hostip"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
