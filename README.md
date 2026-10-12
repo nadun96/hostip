@@ -1,8 +1,15 @@
-# hostip
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hop-logo-dark.svg">
+    <img src="docs/assets/hop-logo.svg" alt="Hop" width="280">
+  </picture>
+</p>
 
-Publish apps running on your PC to the internet through your public IP over
-HTTPS. One Rust binary, no third-party tunnel service, and it doesn't care what
-stack your app is built with.
+# Hop
+
+**Hop** (command: `hostip`) publishes apps running on your PC to the internet
+through your public IP over HTTPS. One Rust binary, no third-party tunnel
+service, and it doesn't care what stack your app is built with.
 
 ```
 hostip expose 3000 8080 udp:50000-60000
@@ -69,6 +76,7 @@ hostip ip      # show the public and LAN IP addresses
 hostip service install --config hostip.toml [--system]   # run in the background
 hostip service uninstall
 hostip relay [--listen 0.0.0.0:7000] [--token TOKEN] [--allow-ports LIST]   # on a public server
+hostip check [PORTS]... [--config hostip.toml] [--relay HOST:PORT --relay-token T --relay-fingerprint F]
 hostip cert    # show the stored certificate
 ```
 
@@ -212,6 +220,29 @@ TCP 3000 -> 192.168.1.10:13000
 UDP 50000-60000 -> 192.168.1.10:50000-60000
 ```
 
+### Checking that visitors can reach you
+
+`hostip check` (same ports or `--config` as `expose`) tests the path from the
+internet: a `hostip relay` you run on a public server connects back to your
+public IP on every TCP port and sends a datagram to every UDP port (the first 64
+of a range). Ports nothing listens on yet get a temporary listener, and a
+temporary router mapping via UPnP, so it works before or while `expose` runs; a
+UDP port the app already holds is reported as not tested. The relay only ever
+probes the address that connected to it with the right token.
+
+```
+Seen from outside (relay 203.0.113.50:7000): public IP 198.51.100.4
+Router's internet address: 100.64.12.7
+
+  TCP 443 -> port 443            reachable
+  UDP 50000 -> port 50000        NOT RECEIVED
+
+- the router's internet address 100.64.12.7 is private or CGNAT: ... use relay mode
+```
+
+It exits with 1 when a checked port is unreachable. Without a relay it reports
+the router side only (UPnP, the router's internet address, CGNAT).
+
 ### Config file
 
 ```toml
@@ -286,3 +317,7 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine64 cargo test --target x86_64-pc-w
 ```
 
 Logging is controlled with `RUST_LOG`, e.g. `RUST_LOG=hostip=debug`.
+
+## License
+
+[MIT](LICENSE). The Hop name and logo (`docs/assets/`) identify this project.
