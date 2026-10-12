@@ -119,6 +119,27 @@ stage dev test
 stage test main
 heads
 
+say "Promoted by hand: a dev -> test pull request merged on GitHub adds a merge commit"
+git checkout --quiet -B dev origin/dev
+printf 'add,100,1,101\n' >>cases.csv
+git commit --quiet -am "more test data"
+git push --quiet origin dev
+git checkout --quiet -B test origin/test
+git merge --quiet --no-ff -m "Merge pull request: dev -> test" origin/dev
+git push --quiet origin test
+git fetch --quiet origin
+heads
+stage test main
+echo "-- the next feature: test now has a merge commit that dev lacks, but it adds nothing"
+git checkout --quiet -B dev origin/dev
+printf 'mul,0,9,0\n' >>cases.csv
+git commit --quiet -am "even more test data"
+git push --quiet origin dev
+git fetch --quiet origin
+stage dev test
+stage test main
+heads
+
 say "Guard: a commit made directly on main is never overwritten"
 git checkout --quiet -B main origin/main
 echo "# hotfix" >>app.sh
