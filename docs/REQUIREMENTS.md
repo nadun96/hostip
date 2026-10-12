@@ -562,4 +562,4 @@ protocol = "udp"
 | Windows | ✅ | Service, firewall rules, CI on windows-latest, Wine-based local testing |
 | Port conflicts | ✅ | A port already in use names its owner: `/proc` on Linux, `netstat` + `tasklist` on Windows (PID 4 reported as HTTP.sys / IIS), `lsof` on macOS (`src/portowner.rs`) |
 | Observability | ✅ | `tracing` logs, `RUST_LOG` filter, `--log-format json` / `HOSTIP_LOG_FORMAT=json` (stderr; the Windows service log file too) |
-| Distribution | ✅ | Release workflow for Windows/Linux/macOS binaries |
+| Distribution | 🟡 | Release workflow: Windows/Linux/macOS binaries, Windows MSI (WiX), winget manifests; signing wired up but needs a code-signing certificate (secrets `WINDOWS_CERT_PFX`/`WINDOWS_CERT_PASSWORD`); winget listing needs a one-time submission |
