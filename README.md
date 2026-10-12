@@ -83,6 +83,7 @@ hostip service uninstall
 hostip relay [--listen 0.0.0.0:7000] [--token TOKEN] [--allow-ports LIST]   # on a public server
 hostip check [PORTS]... [--config hostip.toml] [--relay HOST:PORT --relay-token T --relay-fingerprint F]
 hostip cert    # show the stored certificate
+hostip cert export-ca [--out hop-local-ca.crt]   # local CA for --local-ca, with install steps
 ```
 
 Each port is written `[mode:]local[:public]`:
@@ -109,6 +110,17 @@ accept the Let's Encrypt Subscriber Agreement. Try `--acme-staging` first while
 setting things up; staging certificates are not trusted by browsers but don't
 count against rate limits. Certificates and the ACME account live in
 `<cert-dir>/acme`.
+
+### Trusted on your own devices without Let's Encrypt (local CA)
+
+For a LAN or private setup where Let's Encrypt can't reach you, `--local-ca`
+(or `local_ca = true` under `[tls]`) signs hostip's certificate with a private
+CA created once in the certificate folder, instead of self-signing it.
+`hostip cert export-ca` writes that CA to `hop-local-ca.crt` and prints how to
+install it on Windows, macOS, Linux, Firefox, Android and iOS; devices that
+have it open the links without a warning. It is for your own devices only:
+visitors without the CA still see a warning, and the CA key
+(`local-ca/ca.key`) must stay private.
 
 ### Your own certificate
 

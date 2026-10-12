@@ -282,6 +282,10 @@ pub struct TlsSection {
     pub cert: Option<PathBuf>,
     /// Private key (PEM) for `cert`.
     pub key: Option<PathBuf>,
+    /// Sign the fallback certificate with a local CA (`hostip cert export-ca`)
+    /// instead of self-signing it (F5).
+    #[serde(default)]
+    pub local_ca: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
