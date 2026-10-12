@@ -2,10 +2,12 @@
   Windows installer for Hop (hostip), built with the WiX Toolset v5 by the
   Release workflow:
 
-    wix build packaging/windows/hostip.wxs -arch x64 -d Version=0.1.0 -d Bin=path\to\hostip.exe -o hostip.msi
+    wix build packaging/windows/hostip.wxs -arch x64 -d Version=0.1.0 -d Bin=path\to\hostip.exe
+      -d Gui=path\to\hop-gui.exe -o hostip.msi
 
-  Installs hostip.exe to "C:\Program Files\Hop" and adds that folder to the system
-  PATH. The background service is set up afterwards with `hostip service install`.
+  Installs hostip.exe and the Hop desktop app (hop-gui.exe, with a Start menu
+  entry) to "C:\Program Files\Hop" and adds that folder to the system PATH. The
+  background service is set up afterwards with `hostip service install`.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
@@ -27,6 +29,13 @@
           <Environment Id="AddToPath" Name="PATH" Value="[INSTALLFOLDER]"
               Action="set" Part="last" System="yes" Permanent="no" />
         </Component>
+        <Component Id="Gui">
+          <!-- The Hop desktop app, with a Start menu entry. -->
+          <File Id="HopGuiExe" Source="$(var.Gui)" Name="hop-gui.exe" KeyPath="yes">
+            <Shortcut Id="StartMenuHop" Directory="ProgramMenuFolder" Name="Hop"
+                Description="Publish apps on your PC over HTTPS" WorkingDirectory="INSTALLFOLDER" />
+          </File>
+        </Component>
         <!-- One file per component: WiX derives component GUIDs only for those. -->
         <Component Id="Readme">
           <File Id="Readme" Source="README.md" KeyPath="yes" />
@@ -40,8 +49,11 @@
       </Directory>
     </StandardDirectory>
 
+    <StandardDirectory Id="ProgramMenuFolder" />
+
     <Feature Id="Main" Title="Hop">
       <ComponentRef Id="Binary" />
+      <ComponentRef Id="Gui" />
       <ComponentRef Id="Readme" />
       <ComponentRef Id="License" />
       <ComponentRef Id="ExampleConfig" />

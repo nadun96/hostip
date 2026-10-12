@@ -105,6 +105,7 @@ Internet client ──HTTPS──▶ public IP:443 ──(router port-forward)�
 | Windows paths/ACL | Config and certs under `%ProgramData%\hostip`; private keys readable only by SYSTEM and Administrators |
 | Windows port conflicts | Detect if 443/80 are already taken (IIS/HTTP.sys, Skype, VMware, other servers) and name the owning process |
 | Distribution | Single binary, no runtime deps; signed `.exe` + MSI installer or `winget`; `cargo install` and GitHub Releases for other OSes |
+| Desktop app | ✅ | Hop (`gui/`, `hop-gui`, egui): ports, login and options form, Start/Stop (graceful via `--stop-on-stdin-eof`), visitor links with QR code, generated login, certificate, live log, reachability check and local CA export; shipped in the release archives and the MSI with a Start menu shortcut |
 | Performance | ≥ 5k req/s and < 2 ms added p99 latency on a typical laptop for small responses |
 | Streaming throughput | Saturate a 1 Gbit/s link with TLS on a modern CPU (the home **upload** bandwidth is the real bottleneck); time-to-first-byte overhead < 5 ms |
 | Streaming memory | Bounded per-connection buffers (≤ 64–256 KiB) regardless of stream length or size |
