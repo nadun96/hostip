@@ -60,9 +60,11 @@ video conferencing server is in [`examples/hostip.toml`](examples/hostip.toml).
 hostip expose [PORTS]... [--config hostip.toml] [--public-ip IP] [--bind ADDR] [--cert-dir DIR]
               [--no-acme] [--acme-staging] [--acme-email EMAIL] [--http-listen PORT] [--no-upnp]
               [--auth USER:PASSWORD] [--allow CIDR]... [--max-connections N] [--access-log]
+              [--max-client-rate RATE] [--cert FILE --key FILE]
               [--ip-file FILE] [--on-ip-change CMD] [--export-cert FILE --export-key FILE]
               [--on-cert-renew CMD]
 hostip hash-password   # reads a password on stdin, prints an Argon2 hash for the config
+hostip status  # is it running? public links, certificate expiry
 hostip ip      # show the public and LAN IP addresses
 hostip service install --config hostip.toml [--system]   # run in the background
 hostip service uninstall
@@ -95,11 +97,25 @@ setting things up; staging certificates are not trusted by browsers but don't
 count against rate limits. Certificates and the ACME account live in
 `<cert-dir>/acme`.
 
+### Your own certificate
+
+To serve a certificate you manage yourself (e.g. for a domain), pass
+`--cert chain.pem --key key.pem` or set `cert`/`key` under `[tls]`. Let's
+Encrypt is then skipped, and the files are re-read automatically when they
+change.
+
 ### Apps that serve HTTPS themselves
 
 If an app only listens with TLS (often with its own self-signed certificate),
 set `upstream_tls = true` on its `[[port]]`; hostip then connects to it over
 TLS. Its certificate is not checked, since the connection never leaves this PC.
+
+### Changing the config while running
+
+hostip watches the config file. When it changes and is valid, hostip restarts
+its listeners with the new settings (open connections are closed; certificates
+are kept and `on_ip_change` is not re-run for an unchanged IP). An invalid edit
+is reported and the running setup is kept.
 
 ### Who can connect
 
@@ -117,7 +133,8 @@ blocked for 15 minutes. A port with a login only accepts HTTP.
 Every port also enforces per-IP limits (256 open connections, 1200 new
 connections a minute, generous because many participants can share one
 address) and can be restricted with `allow`/`deny` lists or a
-`max_connections` cap.
+`max_connections` cap. `max_client_rate` (e.g. `8mbit`) caps how fast each
+visitor connection can download, so one viewer cannot use up your upload.
 
 ### Video conferencing (WebRTC) servers
 

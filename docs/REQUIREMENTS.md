@@ -534,18 +534,18 @@ protocol = "udp"
 | F3, F30, F31, F34 | ✅ | Stack-agnostic port specs and modes (`src/config.rs`), HTTP sniffing in `auto` |
 | F4 | ✅ | Self-signed fallback with public/LAN IP SANs (`src/cert.rs`) |
 | F5 | ⬜ | Local CA mode — superseded in practice by Let's Encrypt IP certificates |
-| F6 | ⬜ | User-supplied certificate files |
+| F6 | ✅ | `--cert/--key` or `[tls] cert/key`, reloaded when the files change |
 | F7, F19 | ✅ | IP watcher with confirmation and address-family stickiness; re-issue on change (`src/publicip.rs`, `src/acme.rs`) |
 | F9 | ✅ | HTTP/2 via ALPN |
 | F10 | ✅ | Port-80 listener: ACME HTTP-01 + redirect to https |
 | F12, F26 | ✅ | UPnP-IGD with PCP/NAT-PMP fallback, leases renewed, removed on exit (`src/portmap.rs`; fake-router tests) |
 | F13, F29 | 🟡 | Double-NAT/CGNAT warning from the router's WAN address; Let's Encrypt validation proves 443/80 reachability. No independent outside probe yet |
-| F14 | 🟡 | `expose`, `ip`, `cert`, `hash-password`, `service`, `relay`; no `status` command |
-| F15 | ⬜ | Hot reload of the config file |
+| F14 | ✅ | `expose`, `status`, `ip`, `cert`, `hash-password`, `service`, `relay` |
+| F15 | ✅ | Config file polled; valid changes restart the listeners in-process, invalid ones are rejected |
 | F16 | ✅ | Graceful shutdown with drain (Ctrl+C, SIGTERM, service stop) |
 | F17 | ✅ | Let's Encrypt bare-IP certificates, short-lived profile, TLS-ALPN-01 + HTTP-01 with rotation, renewal at ⅔ lifetime (`src/acme.rs`; Pebble tests) |
 | F18 | ✅ | Share links and a terminal QR code |
-| F23 | 🟡 | Per-port connection cap; per-client bandwidth cap not yet |
+| F23 | ✅ | Per-port connection cap and per-connection download rate cap (`max_client_rate`) |
 | F24 | ✅ | Bodies are never compressed or rewritten |
 | F27, F28 | ✅ | IP file + `on_ip_change`; certificate export + `on_cert_renew` (`src/hooks.rs`) |
 | F32 | ✅ | `upstream_tls` for apps that serve HTTPS themselves |

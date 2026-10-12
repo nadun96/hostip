@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -23,8 +23,10 @@ use hostip::publicip;
 use hostip::relay;
 use hostip::server::{self, Server, ServerOptions};
 use hostip::service;
+use hostip::status;
 
 const DEFAULT_IP_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const CONFIG_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Parser)]
 #[command(version, about = "Publish local apps on your public IP over HTTPS")]
@@ -42,6 +44,12 @@ enum Command {
         /// HTTPS endpoints that return the caller's IP as plain text.
         #[arg(long = "source")]
         sources: Vec<String>,
+    },
+    /// Show whether hostip is running, its public links and its certificate.
+    Status {
+        /// Where the running hostip keeps its data (default: next to the certificates).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
     /// Hash a password for `password_hash` in the config file (reads it from stdin).
     HashPassword,
@@ -98,7 +106,7 @@ struct RelayArgs {
     data_dir: Option<PathBuf>,
 }
 
-#[derive(Args, Default)]
+#[derive(Args, Default, Clone)]
 struct ExposeArgs {
     /// Ports as `[mode:]local[:public]`; mode is auto (default), https, tls, tcp or udp.
     /// Examples: 3000, 3000:443, tls:5000, udp:3478, udp:50000-60000.
@@ -145,6 +153,9 @@ struct ExposeArgs {
     /// Maximum simultaneous connections per port.
     #[arg(long)]
     max_connections: Option<usize>,
+    /// Limit each visitor connection's download speed, e.g. `8mbit` (protects upload bandwidth).
+    #[arg(long, value_parser = hostip::io::parse_rate)]
+    max_client_rate: Option<u64>,
     /// Log every HTTP request.
     #[arg(long)]
     access_log: bool,
@@ -164,6 +175,12 @@ struct ExposeArgs {
     /// Run this command after each certificate export (gets HOSTIP_CERT_FILE, HOSTIP_KEY_FILE).
     #[arg(long)]
     on_cert_renew: Option<String>,
+    /// Serve this certificate chain (PEM) instead of a generated one (needs --key).
+    #[arg(long, requires = "key")]
+    cert: Option<PathBuf>,
+    /// Private key (PEM) for --cert.
+    #[arg(long, requires = "cert")]
+    key: Option<PathBuf>,
     /// Publish through this `hostip relay` (host:port) instead of opening router ports.
     #[arg(long, requires_all = ["relay_token", "relay_fingerprint"])]
     relay: Option<String>,
@@ -198,7 +215,20 @@ async fn run(command: Command) -> Result<()> {
         Command::Expose(args) => {
             let shutdown = CancellationToken::new();
             tokio::spawn(wait_for_signal(shutdown.clone()));
-            expose(*args, shutdown).await
+            expose_with_reload(*args, shutdown).await
+        }
+        Command::Status { data_dir } => {
+            let file = status::path(&data_dir.unwrap_or_else(default_data_dir));
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            match status::read(&file) {
+                Ok(current) => print!("{}", status::render(&current, now)),
+                Err(_) => {
+                    println!("hostip is not running (no {}).", file.display());
+                    println!("For a service or another user, pass --data-dir.");
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
         }
         Command::HashPassword => {
             let mut password = String::new();
@@ -359,7 +389,7 @@ fn run_service(config: PathBuf) -> Result<()> {
             config: Some(config),
             ..ExposeArgs::default()
         };
-        tokio::runtime::Runtime::new()?.block_on(expose(args, shutdown))
+        tokio::runtime::Runtime::new()?.block_on(expose_with_reload(args, shutdown))
     })
 }
 
@@ -411,6 +441,38 @@ fn run_service(_config: PathBuf) -> Result<()> {
     bail!("`hostip service run` is only used by Windows; on Linux the unit runs `hostip expose`")
 }
 
+/// Runs `expose`, restarting it whenever the config file changes to a valid config (F15).
+async fn expose_with_reload(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
+    let Some(path) = args.config.clone() else {
+        return expose(args, shutdown).await;
+    };
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    loop {
+        let mut seen = modified(&path);
+        let run = shutdown.child_token();
+        let task = expose(args.clone(), run.clone());
+        tokio::pin!(task);
+        loop {
+            tokio::select! {
+                result = &mut task => return result,
+                _ = tokio::time::sleep(CONFIG_POLL) => {}
+            }
+            let now = modified(&path);
+            if now == seen {
+                continue;
+            }
+            seen = now;
+            match load_specs(&args) {
+                Ok(_) => break,
+                Err(e) => warn!("config changed but is invalid, keeping the current one: {e:#}"),
+            }
+        }
+        info!("config changed; restarting with the new settings (open connections are closed)");
+        run.cancel();
+        task.await?;
+    }
+}
+
 /// The config file plus the port specs from it and the command line, validated.
 fn load_specs(args: &ExposeArgs) -> Result<(FileConfig, Vec<PortSpec>)> {
     let file = match &args.config {
@@ -434,6 +496,7 @@ fn load_specs(args: &ExposeArgs) -> Result<(FileConfig, Vec<PortSpec>)> {
             spec.access.allow = args.allow.clone();
         }
         spec.access.max_connections = spec.access.max_connections.or(args.max_connections);
+        spec.max_client_rate = spec.max_client_rate.or(args.max_client_rate);
     }
     if specs.is_empty() {
         bail!(
@@ -503,19 +566,43 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
             cert::load_or_generate(&cert_dir, &sans)
         }
     };
-    let (key, info) = self_signed(public_ip)?;
-    info!(
-        "{}{info}",
-        if info.generated {
-            "generated "
-        } else {
-            "using "
-        }
-    );
-    let certs = CertStore::new(key.clone());
-    if let Ok(pem) = info.read_pem() {
-        certs.replace_with_pem(key, pem);
+    let own_cert = match (&args.cert, &args.key) {
+        (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+        _ => file.tls.cert.clone().zip(file.tls.key.clone()),
+    };
+    if file.tls.cert.is_some() != file.tls.key.is_some() {
+        bail!("[tls] needs both `cert` and `key`");
     }
+    let certs = match &own_cert {
+        Some((cert_path, key_path)) => {
+            let pem = cert::PemPair {
+                chain: std::fs::read_to_string(cert_path)?,
+                key: std::fs::read_to_string(key_path)?,
+            };
+            let key = cert::certified_key_from_pem(&pem.chain, &pem.key)
+                .with_context(|| format!("invalid certificate {}", cert_path.display()))?;
+            info!("serving the certificate from {}", cert_path.display());
+            let certs = CertStore::new(key.clone());
+            certs.replace_with_pem(key, pem);
+            certs
+        }
+        None => {
+            let (key, info) = self_signed(public_ip)?;
+            info!(
+                "{}{info}",
+                if info.generated {
+                    "generated "
+                } else {
+                    "using "
+                }
+            );
+            let certs = CertStore::new(key.clone());
+            if let Ok(pem) = info.read_pem() {
+                certs.replace_with_pem(key, pem);
+            }
+            certs
+        }
+    };
 
     let bind = args
         .bind
@@ -564,7 +651,7 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
     if http_bound.is_some() {
         challenge_kinds.push(ChallengeKind::Http01);
     }
-    let acme_enabled = !args.no_acme && file.acme.enabled.unwrap_or(true);
+    let acme_enabled = own_cert.is_none() && !args.no_acme && file.acme.enabled.unwrap_or(true);
     let acme_active = acme_enabled
         && !challenge_kinds.is_empty()
         && !public_ip.is_some_and(publicip::is_non_public);
@@ -639,6 +726,14 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
         manager.set_fallback(Box::new(move |ip| Ok(fallback(Some(ip))?.0)));
         tokio::spawn(manager.run(ip_rx.clone(), shutdown.clone()));
     }
+    if let Some((cert_path, key_path)) = own_cert {
+        tokio::spawn(cert::watch_files(
+            certs.clone(),
+            cert_path,
+            key_path,
+            shutdown.clone(),
+        ));
+    }
     let ip_hooks = IpHooks {
         ip_file: args.ip_file.clone().or(file.network.ip_file.clone()),
         on_change: args
@@ -664,10 +759,33 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
     if let Some(export) = export {
         tokio::spawn(hooks::export_certs(certs.clone(), export));
     }
+    {
+        let specs = specs.clone();
+        let mode = match &relay {
+            Some(r) => format!("relay {}", r.address),
+            None => "direct".to_owned(),
+        };
+        let urls = move |ip: Option<IpAddr>| {
+            let host = url_host(&ip.map_or_else(|| "localhost".to_owned(), |ip| ip.to_string()));
+            specs
+                .iter()
+                .filter(|s| s.mode != Mode::Udp)
+                .map(|s| public_url(s, &host))
+                .collect()
+        };
+        tokio::spawn(status::write_periodically(
+            status::path(&default_data_dir()),
+            mode,
+            urls,
+            certs.clone(),
+            ip_rx.clone(),
+            shutdown.clone(),
+        ));
+    }
     tokio::spawn(report_ip_changes(
         ip_rx,
         specs.clone(),
-        (!acme_active).then(|| {
+        (!acme_active && args.cert.is_none() && file.tls.cert.is_none()).then(|| {
             let certs = certs.clone();
             move |ip| match self_signed(Some(ip))
                 .and_then(|(key, info)| Ok((key, info.read_pem()?)))
@@ -886,6 +1004,13 @@ fn default_sources() -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// Where hostip keeps its state (the certificate directory's parent).
+fn default_data_dir() -> PathBuf {
+    default_cert_dir()
+        .parent()
+        .map_or_else(|| PathBuf::from(".hostip"), PathBuf::from)
 }
 
 fn default_cert_dir() -> PathBuf {
