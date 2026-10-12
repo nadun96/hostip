@@ -46,10 +46,14 @@ enum Command {
         sources: Vec<String>,
     },
     /// Show whether hostip is running, its public links and its certificate.
+    /// Exits with 1 when hostip is not running.
     Status {
         /// Where the running hostip keeps its data (default: next to the certificates).
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Print the raw status as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Hash a password for `password_hash` in the config file (reads it from stdin).
     HashPassword,
@@ -217,11 +221,20 @@ async fn run(command: Command) -> Result<()> {
             tokio::spawn(wait_for_signal(shutdown.clone()));
             expose_with_reload(*args, shutdown).await
         }
-        Command::Status { data_dir } => {
+        Command::Status { data_dir, json } => {
             let file = status::path(&data_dir.unwrap_or_else(default_data_dir));
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
             match status::read(&file) {
-                Ok(current) => print!("{}", status::render(&current, now)),
+                Ok(current) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&current)?);
+                    } else {
+                        print!("{}", status::render(&current, now));
+                    }
+                    if !current.is_running(now) {
+                        std::process::exit(1);
+                    }
+                }
                 Err(_) => {
                     println!("hostip is not running (no {}).", file.display());
                     println!("For a service or another user, pass --data-dir.");
@@ -611,8 +624,9 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
     let host = public_ip
         .or(lan_ip)
         .map_or_else(|| "localhost".to_owned(), |ip| ip.to_string());
+    let guard = Guard::new(file.limits.clone());
     let options = ServerOptions {
-        guard: Guard::new(file.limits.clone()),
+        guard: guard.clone(),
         access_log: args.access_log || file.server.access_log,
     };
     let mut server = Server::bind_with(&specs, bind, certs.clone(), &host, options).await?;
@@ -684,6 +698,7 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
         tokio::spawn(publicip::watch(sources, interval, ip_tx, shutdown.clone()));
     }
 
+    let mut acme_outcomes = None;
     if acme_active {
         let directory = args
             .acme_directory
@@ -724,6 +739,7 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
         let manager = AcmeManager::new(opts, certs.clone(), challenges);
         let fallback = self_signed.clone();
         manager.set_fallback(Box::new(move |ip| Ok(fallback(Some(ip))?.0)));
+        acme_outcomes = Some(manager.outcomes());
         tokio::spawn(manager.run(ip_rx.clone(), shutdown.clone()));
     }
     if let Some((cert_path, key_path)) = own_cert {
@@ -773,12 +789,17 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
                 .map(|s| public_url(s, &host))
                 .collect()
         };
+        let guard = guard.clone();
         tokio::spawn(status::write_periodically(
             status::path(&default_data_dir()),
-            mode,
-            urls,
-            certs.clone(),
-            ip_rx.clone(),
+            status::Sources {
+                mode,
+                urls: Box::new(urls),
+                certs: certs.clone(),
+                ip: ip_rx.clone(),
+                acme: acme_outcomes,
+                open_connections: Box::new(move || guard.open_connections()),
+            },
             shutdown.clone(),
         ));
     }
