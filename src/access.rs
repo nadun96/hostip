@@ -145,6 +145,11 @@ impl Guard {
             state.auth_failures = 0;
         }
     }
+
+    /// Connections open right now, across all ports and IPs.
+    pub fn open_connections(&self) -> usize {
+        self.ips.lock().unwrap().values().map(|s| s.open).sum()
+    }
 }
 
 /// Holds one connection slot for an IP until dropped.
