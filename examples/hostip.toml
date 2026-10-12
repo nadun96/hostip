@@ -26,6 +26,7 @@ staging = false                 # set true while testing (untrusted, no rate lim
 
 [tls]
 # dir = 'C:\ProgramData\hostip\certs'
+# local_ca = true               # sign the fallback certificate with a local CA (hostip cert export-ca)
 
 # Optional: copy the trusted certificate for a TURN-over-TLS server.
 # [tls.export]
