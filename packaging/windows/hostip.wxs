@@ -1,0 +1,50 @@
+<!--
+  Windows installer for Hop (hostip), built with the WiX Toolset v5 by the
+  Release workflow:
+
+    wix build packaging/windows/hostip.wxs -arch x64 -d Version=0.1.0 -d Bin=path\to\hostip.exe -o hostip.msi
+
+  Installs hostip.exe to "C:\Program Files\Hop" and adds that folder to the system
+  PATH. The background service is set up afterwards with `hostip service install`.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Hop (hostip)"
+      Manufacturer="nadun96"
+      Version="$(var.Version)"
+      UpgradeCode="9f01d72d-83fc-4582-9080-dcf55d72ba0f"
+      Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Hop is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/nadun96/hostip" />
+    <Property Id="ARPCOMMENTS" Value="Publish local apps on your public IP over HTTPS" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Hop">
+        <Component Id="Binary">
+          <File Id="HostipExe" Source="$(var.Bin)" Name="hostip.exe" KeyPath="yes" />
+          <Environment Id="AddToPath" Name="PATH" Value="[INSTALLFOLDER]"
+              Action="set" Part="last" System="yes" Permanent="no" />
+        </Component>
+        <!-- One file per component: WiX derives component GUIDs only for those. -->
+        <Component Id="Readme">
+          <File Id="Readme" Source="README.md" KeyPath="yes" />
+        </Component>
+        <Component Id="License">
+          <File Id="License" Source="LICENSE" Name="LICENSE.txt" KeyPath="yes" />
+        </Component>
+        <Component Id="ExampleConfig">
+          <File Id="ExampleConfig" Source="examples/hostip.toml" Name="hostip.example.toml" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Hop">
+      <ComponentRef Id="Binary" />
+      <ComponentRef Id="Readme" />
+      <ComponentRef Id="License" />
+      <ComponentRef Id="ExampleConfig" />
+    </Feature>
+  </Package>
+</Wix>

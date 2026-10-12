@@ -189,8 +189,19 @@ usual flow (a pull request into `dev`), then either push a tag such as `v0.2.0`
 on `main`, or open **Actions → Release → Run workflow** on `main` and enter the
 version: the workflow creates the tag itself. Either way it checks that the
 version matches `Cargo.toml`, builds Windows, Linux (x86_64, arm64) and macOS
-(arm64, x86_64) packages with SHA-256 checksums, and opens a **draft** release
-to review and publish.
+(arm64, x86_64) packages with SHA-256 checksums, the Windows installer
+(`hostip-<version>-x86_64.msi`, WiX Toolset) and winget manifests, and opens a
+**draft** release to review and publish. Pull requests that change
+`packaging/` or the workflow run the same build without releasing.
+
+- **Code signing:** add the repository secrets `WINDOWS_CERT_PFX` (the base64
+  of a `.pfx` code-signing certificate) and `WINDOWS_CERT_PASSWORD`; `hostip.exe`
+  and the MSI are then signed and timestamped. Without them both are unsigned,
+  and Windows SmartScreen warns on first run.
+- **winget:** after publishing the release, unzip
+  `hostip-<version>-winget-manifests.zip` and submit the folder with
+  `wingetcreate submit` (or a pull request to `microsoft/winget-pkgs`). Then
+  `winget install nadun96.Hop` works once Microsoft has reviewed it.
 
 ## One-time setup on GitHub
 

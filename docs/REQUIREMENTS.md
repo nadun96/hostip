@@ -561,5 +561,6 @@ protocol = "udp"
 | S9 | ✅ | Windows service as LocalService by default; systemd unit with only CAP_NET_BIND_SERVICE |
 | Windows | ✅ | Service, firewall rules, CI on windows-latest, Wine-based local testing |
 | Port conflicts | ✅ | A port already in use names its owner: `/proc` on Linux, `netstat` + `tasklist` on Windows (PID 4 reported as HTTP.sys / IIS), `lsof` on macOS (`src/portowner.rs`) |
+| Performance | ✅ | `cargo bench --bench e2e` (`benches/e2e.rs`, CI: `bench.yml`) on a 4-vCPU Linux VM: 52k req/s over 64 TLS connections, +0.16 ms p99 and +0.10 ms TTFB vs direct, 8.7 Gbit/s TLS streaming on one connection, +3.3 MiB while streaming 1 GiB, 10.4 MiB idle RSS, 5 ms startup |
 | Observability | ✅ | `tracing` logs, `RUST_LOG` filter, `--log-format json` / `HOSTIP_LOG_FORMAT=json` (stderr; the Windows service log file too) |
-| Distribution | ✅ | Release workflow for Windows/Linux/macOS binaries |
+| Distribution | 🟡 | Release workflow: Windows/Linux/macOS binaries, Windows MSI (WiX), winget manifests; signing wired up but needs a code-signing certificate (secrets `WINDOWS_CERT_PFX`/`WINDOWS_CERT_PASSWORD`); winget listing needs a one-time submission |

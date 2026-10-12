@@ -1,0 +1,18 @@
+PackageIdentifier: nadun96.Hop
+PackageVersion: {VERSION}
+PackageLocale: en-US
+Publisher: nadun96
+PublisherUrl: https://github.com/nadun96
+PackageName: Hop
+PackageUrl: https://github.com/nadun96/hostip
+License: MIT
+LicenseUrl: https://github.com/nadun96/hostip/blob/main/LICENSE
+ShortDescription: Publish apps running on your PC on your public IP over HTTPS, with Let's Encrypt IP certificates.
+Moniker: hostip
+Tags:
+  - https
+  - reverse-proxy
+  - lets-encrypt
+  - self-hosting
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

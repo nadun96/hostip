@@ -1,9 +1,14 @@
 name: Release
 
-# Builds binaries for every platform and attaches them to a GitHub release,
-# created as a draft so it can be reviewed before publishing. Start it either by
-# pushing a tag like v0.2.0, or with "Run workflow" on main (Actions -> Release),
-# which creates the tag itself.
+# Builds binaries for every platform, the Windows installer (MSI) and winget
+# manifests, and attaches them to a GitHub release, created as a draft so it can
+# be reviewed before publishing. Start it either by pushing a tag like v0.2.0, or
+# with "Run workflow" on main (Actions -> Release), which creates the tag itself.
+# Pull requests that change packaging run everything except the release (dry run).
+#
+# Code signing (optional): add the repository secrets WINDOWS_CERT_PFX (the
+# base64 of a .pfx code-signing certificate) and WINDOWS_CERT_PASSWORD; hostip.exe
+# and the MSI are then signed. Without them, both are built unsigned.
 on:
   push:
     tags: ["v*"]
@@ -12,29 +17,44 @@ on:
       version:
         description: "Version tag to create, e.g. v0.2.0 (must match Cargo.toml)"
         required: true
+  pull_request:
+    paths:
+      - "packaging/**"
+      - ".github/workflows/release.yml"
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
-  VERSION: ${{ inputs.version || github.ref_name }}
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: Release only from main, with the version in Cargo.toml
+        id: version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/main ]; then
-            echo "::error::run the release from main, not $GITHUB_REF_NAME"; exit 1
-          fi
           cargo_version="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          if [ "$VERSION" != "$cargo_version" ]; then
-            echo "::error::version $VERSION does not match Cargo.toml ($cargo_version)"; exit 1
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch)
+              if [ "$GITHUB_REF" != refs/heads/main ]; then
+                echo "::error::run the release from main, not $GITHUB_REF_NAME"; exit 1
+              fi
+              version="$INPUT_VERSION" ;;
+            push) version="$GITHUB_REF_NAME" ;;
+            *) version="$cargo_version" ;;  # pull request: dry run
+          esac
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::version $version does not match Cargo.toml ($cargo_version)"; exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
     needs: check
@@ -58,6 +78,10 @@ jobs:
             target: x86_64-apple-darwin
             archive: tar.gz
     runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -67,6 +91,23 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Find signtool and load the certificate
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_PFX != ''
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          "SIGNTOOL=$($signtool.FullName)" >> $env:GITHUB_ENV
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+      - name: Sign hostip.exe
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_PFX != ''
+        shell: pwsh
+        run: >
+          & $env:SIGNTOOL sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:WINDOWS_CERT_PASSWORD
+          /fd SHA256 /tr http://timestamp.digicert.com /td SHA256
+          "target\${{ matrix.target }}\release\hostip.exe"
+
       - name: Package
         shell: bash
         run: |
@@ -82,13 +123,50 @@ jobs:
             tar czf "$name.tar.gz" "$name"
             shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           fi
+
+      - name: Build the MSI (WiX Toolset)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix build packaging/windows/hostip.wxs -arch x64 \
+            -d "Version=${VERSION#v}" \
+            -d "Bin=target/${{ matrix.target }}/release/hostip.exe" \
+            -o "hostip-${VERSION}-x86_64.msi"
+      - name: Sign the MSI
+        if: runner.os == 'Windows' && env.WINDOWS_CERT_PFX != ''
+        shell: pwsh
+        run: >
+          & $env:SIGNTOOL sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:WINDOWS_CERT_PASSWORD
+          /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d "Hop (hostip)"
+          "hostip-$env:VERSION-x86_64.msi"
+      - name: Checksum the MSI and write winget manifests
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          msi="hostip-${VERSION}-x86_64.msi"
+          sha256sum "$msi" > "$msi.sha256"
+          sha="$(cut -d' ' -f1 "$msi.sha256" | tr a-f A-F)"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/${msi}"
+          dir="winget/manifests/n/nadun96/Hop/${VERSION#v}"
+          mkdir -p "$dir"
+          for f in packaging/winget/*.yaml; do
+            sed -e "s|{VERSION}|${VERSION#v}|g" -e "s|{URL}|$url|g" -e "s|{SHA256}|$sha|g" \
+              "$f" > "$dir/$(basename "$f")"
+          done
+          7z a "hostip-${VERSION}-winget-manifests.zip" ./winget/* > /dev/null
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: hostip-*.${{ matrix.archive }}*
+          path: |
+            hostip-*.${{ matrix.archive }}*
+            hostip-*.msi*
+            hostip-*-winget-manifests.zip
 
   release:
-    needs: build
+    needs: [check, build]
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -97,7 +175,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           # From "Run workflow" this creates the tag on the commit that was built.
-          tag_name: ${{ env.VERSION }}
+          tag_name: ${{ needs.check.outputs.version }}
           target_commitish: ${{ github.sha }}
           draft: true
           generate_release_notes: true
