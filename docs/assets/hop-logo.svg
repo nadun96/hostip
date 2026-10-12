@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 348 134" role="img" aria-label="Hop">
+  <defs>
+    <linearGradient id="hop-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0EA5E9"/>
+      <stop offset="1" stop-color="#6366F1"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="30" fill="url(#hop-bg)"/>
+  <path d="M24 98 H104" stroke="#fff" stroke-opacity=".35" stroke-width="6" stroke-linecap="round"/>
+  <path d="M36 90 C 42 30, 90 30, 95 80" fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round"/>
+  <path d="M84 72 L95 84 L106 72" fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="36" cy="90" r="10" fill="#fff"/>
+  <g fill="none" stroke="#0F172A" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M160 32 V98 M196 32 V98 M160 65 H196"/>
+    <circle cx="242" cy="76" r="22"/>
+    <path d="M288 54 V120"/>
+    <circle cx="310" cy="76" r="22"/>
+  </g>
+</svg>

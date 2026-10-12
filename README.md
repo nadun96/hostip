@@ -1,8 +1,15 @@
-# hostip
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hop-logo-dark.svg">
+    <img src="docs/assets/hop-logo.svg" alt="Hop" width="280">
+  </picture>
+</p>
 
-Publish apps running on your PC to the internet through your public IP over
-HTTPS. One Rust binary, no third-party tunnel service, and it doesn't care what
-stack your app is built with.
+# Hop
+
+**Hop** (command: `hostip`) publishes apps running on your PC to the internet
+through your public IP over HTTPS. One Rust binary, no third-party tunnel
+service, and it doesn't care what stack your app is built with.
 
 ```
 hostip expose 3000 8080 udp:50000-60000
@@ -286,3 +293,7 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine64 cargo test --target x86_64-pc-w
 ```
 
 Logging is controlled with `RUST_LOG`, e.g. `RUST_LOG=hostip=debug`.
+
+## License
+
+[MIT](LICENSE). The Hop name and logo (`docs/assets/`) identify this project.
