@@ -31,6 +31,7 @@ jobs:
           go-version: stable
       - if: runner.os == 'Linux'
         run: go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # The workspace: hostip and the Hop desktop app (gui/).
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
