@@ -5,6 +5,7 @@ edition = "2024"
 description = "Publish local apps on your public IP over HTTPS, with Let's Encrypt IP certificates"
 repository = "https://github.com/nadun96/hostip"
 readme = "README.md"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -28,7 +29,7 @@ ring = "0.17.14"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-time = "0.3.55"
+time = { version = "0.3.55", features = ["formatting"] }
 tokio = { version = "1.53.2", features = ["full"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }

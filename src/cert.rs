@@ -1,15 +1,14 @@
 //! Certificate storage and hot-swappable serving.
 //!
 //! The self-signed certificate (F4) is served until the Let's Encrypt bare-IP
-//! certificate (F17, see [`crate::acme`]) is issued and swapped in, unless the
-//! user supplies their own certificate files (F6), which are then served instead.
+//! certificate (F17, see [`crate::acme`]) is issued and swapped in.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::crypto::ring::sign::any_supported_type;
@@ -20,8 +19,6 @@ use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
 
 const CERT_FILE: &str = "self-signed.pem";
 const KEY_FILE: &str = "self-signed.key";
@@ -224,6 +221,44 @@ pub fn certified_key_from_pem(chain_pem: &str, key_pem: &str) -> Result<Certifie
     Ok(CertifiedKey::new(certs, any_supported_type(&key)?))
 }
 
+/// Reloads a user-supplied certificate whenever its files change (e.g. after an
+/// external renewal), checking every 30 seconds.
+pub async fn watch_files(
+    certs: Arc<CertStore>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut last = (modified(&cert_path), modified(&key_path));
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+        }
+        let now = (modified(&cert_path), modified(&key_path));
+        if now == last {
+            continue;
+        }
+        last = now;
+        let loaded = (|| -> Result<(CertifiedKey, PemPair)> {
+            let pem = PemPair {
+                chain: std::fs::read_to_string(&cert_path)?,
+                key: std::fs::read_to_string(&key_path)?,
+            };
+            Ok((certified_key_from_pem(&pem.chain, &pem.key)?, pem))
+        })();
+        match loaded {
+            Ok((key, pem)) => {
+                certs.replace_with_pem(key, pem);
+                tracing::info!("reloaded the certificate from {}", cert_path.display());
+            }
+            // Often a half-written pair during renewal; the next check picks it up.
+            Err(e) => tracing::warn!("cannot reload {}: {e:#}", cert_path.display()),
+        }
+    }
+}
+
 /// Builds a rustls signing key from PEM files.
 pub fn load_pem(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
     let certs = CertificateDer::pem_file_iter(cert_path)
@@ -232,142 +267,6 @@ pub fn load_pem(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
     let key = PrivateKeyDer::from_pem_file(key_path)
         .with_context(|| format!("cannot read {}", key_path.display()))?;
     Ok(CertifiedKey::new(certs, any_supported_type(&key)?))
-}
-
-/// A certificate and key the user supplied as PEM files (F6).
-#[derive(Debug)]
-pub struct UserCert {
-    pub key: CertifiedKey,
-    pub pem: PemPair,
-    /// Names (DNS and IP) the leaf certificate covers.
-    pub sans: Vec<String>,
-    pub not_after: OffsetDateTime,
-}
-
-/// Loads a user-supplied certificate chain and its private key, checking that
-/// they belong together.
-pub fn load_user(cert_path: &Path, key_path: &Path) -> Result<UserCert> {
-    let chain = std::fs::read_to_string(cert_path)
-        .with_context(|| format!("cannot read {}", cert_path.display()))?;
-    let key_pem = std::fs::read_to_string(key_path)
-        .with_context(|| format!("cannot read {}", key_path.display()))?;
-    let key = certified_key_from_pem(&chain, &key_pem)
-        .with_context(|| format!("invalid certificate files {}", cert_path.display()))?;
-    let leaf = key
-        .cert
-        .first()
-        .with_context(|| format!("no certificate in {}", cert_path.display()))?;
-    key.keys_match().map_err(|e| {
-        anyhow!(
-            "{} does not match the certificate in {}: {e}",
-            key_path.display(),
-            cert_path.display()
-        )
-    })?;
-    let (_, parsed) = x509_parser::parse_x509_certificate(leaf)
-        .map_err(|e| anyhow!("invalid certificate in {}: {e}", cert_path.display()))?;
-    let not_after = OffsetDateTime::from_unix_timestamp(parsed.validity().not_after.timestamp())?;
-    let mut sans = Vec::new();
-    if let Ok(Some(ext)) = parsed.subject_alternative_name() {
-        use x509_parser::extensions::GeneralName;
-        for name in &ext.value.general_names {
-            match name {
-                GeneralName::DNSName(dns) => sans.push((*dns).to_owned()),
-                GeneralName::IPAddress(bytes) => {
-                    if let Ok(v4) = <[u8; 4]>::try_from(*bytes) {
-                        sans.push(std::net::IpAddr::from(v4).to_string());
-                    } else if let Ok(v6) = <[u8; 16]>::try_from(*bytes) {
-                        sans.push(std::net::IpAddr::from(v6).to_string());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(UserCert {
-        key,
-        pem: PemPair {
-            chain,
-            key: key_pem,
-        },
-        sans,
-        not_after,
-    })
-}
-
-impl fmt::Display for UserCert {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "certificate for [{}], valid until {}",
-            self.sans.join(", "),
-            self.not_after.date()
-        )
-    }
-}
-
-/// Loads the user's certificate files and serves them, re-reading both whenever
-/// either changes on disk (e.g. after certbot renews them). A broken update keeps
-/// the previous certificate in service.
-pub fn serve_user(
-    certs: Arc<CertStore>,
-    cert_path: PathBuf,
-    key_path: PathBuf,
-    interval: std::time::Duration,
-    shutdown: CancellationToken,
-) -> impl Future<Output = ()> {
-    let stamp = move |c: &Path, k: &Path| (modified(c), modified(k));
-    async move {
-        let mut last = stamp(&cert_path, &key_path);
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = tokio::time::sleep(interval) => {}
-            }
-            let now = stamp(&cert_path, &key_path);
-            if now == last {
-                continue;
-            }
-            // Give a writer replacing both files a moment to finish the second one.
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            last = stamp(&cert_path, &key_path);
-            match load_user(&cert_path, &key_path) {
-                Ok(user) => {
-                    info!("reloaded {user}");
-                    certs.replace_with_pem(user.key, user.pem);
-                }
-                Err(e) => warn!("keeping the current certificate: {e:#}"),
-            }
-        }
-    }
-}
-
-fn modified(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// Checks that a certificate covers `name` (an IP address or host name).
-pub fn covers(sans: &[String], name: &str) -> bool {
-    sans.iter().any(|san| {
-        san.eq_ignore_ascii_case(name)
-            || san.strip_prefix("*.").is_some_and(|base| {
-                name.split_once('.').is_some_and(|(label, rest)| {
-                    !label.is_empty() && rest.eq_ignore_ascii_case(base)
-                })
-            })
-    })
-}
-
-/// Rejects a certificate path pair given only half-way.
-pub fn user_paths(
-    cert: Option<PathBuf>,
-    key: Option<PathBuf>,
-) -> Result<Option<(PathBuf, PathBuf)>> {
-    match (cert, key) {
-        (Some(c), Some(k)) => Ok(Some((c, k))),
-        (None, None) => Ok(None),
-        _ => bail!("a certificate needs both `cert` and `key`"),
-    }
 }
 
 /// Writes a private key readable only by the current user (S6).
@@ -413,6 +312,32 @@ mod tests {
         assert_eq!(second.sans, sans(&["203.0.113.7", "localhost"]));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn reloads_user_certificate_files() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (key_a, info_a) = load_or_generate(a.path(), &sans(&["a.example"])).unwrap();
+        let (_, info_b) = load_or_generate(b.path(), &sans(&["b.example"])).unwrap();
+        let store = CertStore::new(key_a);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(watch_files(
+            store.clone(),
+            info_a.cert_path.clone(),
+            info_a.key_path.clone(),
+            shutdown.clone(),
+        ));
+        tokio::task::yield_now().await;
+        std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtimes
+        std::fs::copy(&info_b.cert_path, &info_a.cert_path).unwrap();
+        std::fs::copy(&info_b.key_path, &info_a.key_path).unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store.current_pem().unwrap().chain,
+            std::fs::read_to_string(&info_b.cert_path).unwrap()
+        );
+        shutdown.cancel();
+    }
+
     #[test]
     fn regenerates_when_ip_changes() {
         let dir = tempfile::tempdir().unwrap();
@@ -420,91 +345,5 @@ mod tests {
         let (_, info) = load_or_generate(dir.path(), &sans(&["198.51.100.9"])).unwrap();
         assert!(info.generated);
         assert_eq!(info.sans, sans(&["198.51.100.9"]));
-    }
-
-    fn write_pair(dir: &Path, names: &[&str]) -> (PathBuf, PathBuf) {
-        let (cert_pem, key_pem, _) =
-            generate(&names.iter().map(|s| s.to_string()).collect()).unwrap();
-        let (c, k) = (dir.join("user.pem"), dir.join("user.key"));
-        std::fs::write(&c, cert_pem).unwrap();
-        std::fs::write(&k, key_pem).unwrap();
-        (c, k)
-    }
-
-    #[test]
-    fn loads_user_certificate() {
-        let dir = tempfile::tempdir().unwrap();
-        let (c, k) = write_pair(dir.path(), &["example.org", "203.0.113.7", "::1"]);
-        let user = load_user(&c, &k).unwrap();
-        assert_eq!(user.sans, sans(&["203.0.113.7", "::1", "example.org"]));
-        assert!(user.not_after > OffsetDateTime::now_utc());
-    }
-
-    #[test]
-    fn rejects_mismatched_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let (c, _) = write_pair(dir.path(), &["example.org"]);
-        let other = KeyPair::generate().unwrap();
-        let k = dir.path().join("other.key");
-        std::fs::write(&k, other.serialize_pem()).unwrap();
-        let err = load_user(&c, &k).unwrap_err();
-        assert!(format!("{err:#}").contains("does not match"), "{err:#}");
-    }
-
-    #[test]
-    fn name_coverage() {
-        let names = sans(&["203.0.113.7", "*.example.org", "Host.test"]);
-        assert!(covers(&names, "203.0.113.7"));
-        assert!(covers(&names, "a.example.org"));
-        assert!(covers(&names, "host.test"));
-        assert!(!covers(&names, "example.org"));
-        assert!(!covers(&names, "a.b.example.org"));
-        assert!(!covers(&names, "198.51.100.9"));
-    }
-
-    #[test]
-    fn half_given_paths_are_an_error() {
-        assert!(user_paths(Some("c".into()), None).is_err());
-        assert!(user_paths(None, None).unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn reloads_changed_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let (c, k) = write_pair(dir.path(), &["one.test"]);
-        let user = load_user(&c, &k).unwrap();
-        let store = CertStore::new(user.key);
-        let mut changes = store.subscribe();
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(serve_user(
-            store.clone(),
-            c.clone(),
-            k.clone(),
-            std::time::Duration::from_millis(50),
-            shutdown.clone(),
-        ));
-        // Coarse file-system timestamps: make sure the rewrite gets a new mtime.
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        write_pair(dir.path(), &["two.test"]);
-        tokio::time::timeout(std::time::Duration::from_secs(10), changes.changed())
-            .await
-            .expect("reload")
-            .unwrap();
-        assert!(
-            store
-                .current_pem()
-                .unwrap()
-                .chain
-                .contains("BEGIN CERTIFICATE")
-        );
-        let leaf = store.current().cert[0].clone();
-        let (_, parsed) = x509_parser::parse_x509_certificate(&leaf).unwrap();
-        let san = parsed.subject_alternative_name().unwrap().unwrap();
-        assert_eq!(
-            format!("{:?}", san.value.general_names[0]),
-            "DNSName(\"two.test\")"
-        );
-        shutdown.cancel();
-        task.await.unwrap();
     }
 }

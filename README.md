@@ -1,8 +1,15 @@
-# hostip
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hop-logo-dark.svg">
+    <img src="docs/assets/hop-logo.svg" alt="Hop" width="280">
+  </picture>
+</p>
 
-Publish apps running on your PC to the internet through your public IP over
-HTTPS. One Rust binary, no third-party tunnel service, and it doesn't care what
-stack your app is built with.
+# Hop
+
+**Hop** (command: `hostip`) publishes apps running on your PC to the internet
+through your public IP over HTTPS. One Rust binary, no third-party tunnel
+service, and it doesn't care what stack your app is built with.
 
 ```
 hostip expose 3000 8080 udp:50000-60000
@@ -58,16 +65,18 @@ video conferencing server is in [`examples/hostip.toml`](examples/hostip.toml).
 
 ```
 hostip expose [PORTS]... [--config hostip.toml] [--public-ip IP] [--bind ADDR] [--cert-dir DIR]
-              [--cert FILE --key FILE]
               [--no-acme] [--acme-staging] [--acme-email EMAIL] [--http-listen PORT] [--no-upnp]
               [--auth USER:PASSWORD] [--allow CIDR]... [--max-connections N] [--access-log]
+              [--max-client-rate RATE] [--cert FILE --key FILE]
               [--ip-file FILE] [--on-ip-change CMD] [--export-cert FILE --export-key FILE]
               [--on-cert-renew CMD]
 hostip hash-password   # reads a password on stdin, prints an Argon2 hash for the config
+hostip status [--json] [--data-dir DIR]  # is it running? links, certificate expiry, last renewal, connections
 hostip ip      # show the public and LAN IP addresses
 hostip service install --config hostip.toml [--system]   # run in the background
 hostip service uninstall
 hostip relay [--listen 0.0.0.0:7000] [--token TOKEN] [--allow-ports LIST]   # on a public server
+hostip check [PORTS]... [--config hostip.toml] [--relay HOST:PORT --relay-token T --relay-fingerprint F]
 hostip cert    # show the stored certificate
 ```
 
@@ -98,19 +107,23 @@ count against rate limits. Certificates and the ACME account live in
 
 ### Your own certificate
 
-To serve a certificate you already have (for a domain pointing at this PC, or
-from your own CA), pass `--cert chain.pem --key key.pem` or set `cert` and
-`key` under `[tls]`. Let's Encrypt and the self-signed certificate are then
-off. The files are checked every minute and reloaded when they change, so a
-renewal by certbot or similar is picked up without a restart; a broken update
-keeps the previous certificate in service. If the certificate does not cover
-the public IP, links use its first domain name.
+To serve a certificate you manage yourself (e.g. for a domain), pass
+`--cert chain.pem --key key.pem` or set `cert`/`key` under `[tls]`. Let's
+Encrypt is then skipped, and the files are re-read automatically when they
+change.
 
 ### Apps that serve HTTPS themselves
 
 If an app only listens with TLS (often with its own self-signed certificate),
 set `upstream_tls = true` on its `[[port]]`; hostip then connects to it over
 TLS. Its certificate is not checked, since the connection never leaves this PC.
+
+### Changing the config while running
+
+hostip watches the config file. When it changes and is valid, hostip restarts
+its listeners with the new settings (open connections are closed; certificates
+are kept and `on_ip_change` is not re-run for an unchanged IP). An invalid edit
+is reported and the running setup is kept.
 
 ### Who can connect
 
@@ -128,7 +141,8 @@ blocked for 15 minutes. A port with a login only accepts HTTP.
 Every port also enforces per-IP limits (256 open connections, 1200 new
 connections a minute, generous because many participants can share one
 address) and can be restricted with `allow`/`deny` lists or a
-`max_connections` cap.
+`max_connections` cap. `max_client_rate` (e.g. `8mbit`) caps how fast each
+visitor connection can download, so one viewer cannot use up your upload.
 
 ### Video conferencing (WebRTC) servers
 
@@ -206,6 +220,29 @@ TCP 3000 -> 192.168.1.10:13000
 UDP 50000-60000 -> 192.168.1.10:50000-60000
 ```
 
+### Checking that visitors can reach you
+
+`hostip check` (same ports or `--config` as `expose`) tests the path from the
+internet: a `hostip relay` you run on a public server connects back to your
+public IP on every TCP port and sends a datagram to every UDP port (the first 64
+of a range). Ports nothing listens on yet get a temporary listener, and a
+temporary router mapping via UPnP, so it works before or while `expose` runs; a
+UDP port the app already holds is reported as not tested. The relay only ever
+probes the address that connected to it with the right token.
+
+```
+Seen from outside (relay 203.0.113.50:7000): public IP 198.51.100.4
+Router's internet address: 100.64.12.7
+
+  TCP 443 -> port 443            reachable
+  UDP 50000 -> port 50000        NOT RECEIVED
+
+- the router's internet address 100.64.12.7 is private or CGNAT: ... use relay mode
+```
+
+It exits with 1 when a checked port is unreachable. Without a relay it reports
+the router side only (UPnP, the router's internet address, CGNAT).
+
 ### Config file
 
 ```toml
@@ -280,3 +317,14 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine64 cargo test --target x86_64-pc-w
 ```
 
 Logging is controlled with `RUST_LOG`, e.g. `RUST_LOG=hostip=debug`.
+
+Each feature gets its own `feature/<name>` branch and a pull request into `dev`.
+From there the pipeline promotes automatically: `dev` → `test` when CI passes,
+`test` → `main` when the end-to-end smoke tests pass. See
+[docs/WORKFLOW.md](docs/WORKFLOW.md) for the flow, the test data, and a runnable
+demo (`scripts/demo-flow.sh`).
+
+## License
+
+[MIT](LICENSE). The Hop name and logo (`docs/assets/`) identify this project.
+

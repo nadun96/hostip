@@ -153,6 +153,16 @@ impl Issued {
 /// Produces the certificate to serve for a new IP until Let's Encrypt has issued one.
 pub type Fallback = Box<dyn Fn(IpAddr) -> Result<CertifiedKey> + Send + Sync>;
 
+/// Result of the latest attempt to get or keep a certificate (for `hostip status`).
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub at: OffsetDateTime,
+    /// `None` on success.
+    pub error: Option<String>,
+    /// When the next renewal or retry happens.
+    pub next: OffsetDateTime,
+}
+
 pub struct AcmeManager {
     opts: AcmeOptions,
     certs: Arc<CertStore>,
@@ -162,6 +172,7 @@ pub struct AcmeManager {
     /// Counts attempts so retries alternate between the usable challenge types
     /// (e.g. when the ISP blocks 443 but not 80).
     attempts: std::sync::atomic::AtomicUsize,
+    outcome: watch::Sender<Option<Outcome>>,
 }
 
 impl AcmeManager {
@@ -173,7 +184,13 @@ impl AcmeManager {
             account: OnceCell::new(),
             fallback: OnceLock::new(),
             attempts: std::sync::atomic::AtomicUsize::new(0),
+            outcome: watch::Sender::new(None),
         })
+    }
+
+    /// Follows the result of each attempt.
+    pub fn outcomes(&self) -> watch::Receiver<Option<Outcome>> {
+        self.outcome.subscribe()
     }
 
     /// Sets how to build the stand-in certificate served right after an IP change.
@@ -193,22 +210,30 @@ impl AcmeManager {
             let current = *ip.borrow_and_update();
             let wake_at = match current {
                 None => None,
-                Some(addr) => match self.ensure(addr).await {
-                    Ok(renew_at) => {
-                        failures = 0;
-                        Some(renew_at)
-                    }
-                    Err(e) => {
-                        let delay = RETRY_DELAYS[failures.min(RETRY_DELAYS.len() - 1)];
-                        failures += 1;
-                        warn!("Let's Encrypt certificate for {addr} failed: {e:#}");
-                        warn!(
-                            "serving the self-signed certificate; retrying in {} min",
-                            delay.as_secs() / 60
-                        );
-                        Some(OffsetDateTime::now_utc() + delay)
-                    }
-                },
+                Some(addr) => {
+                    let (next, error) = match self.ensure(addr).await {
+                        Ok(renew_at) => {
+                            failures = 0;
+                            (renew_at, None)
+                        }
+                        Err(e) => {
+                            let delay = RETRY_DELAYS[failures.min(RETRY_DELAYS.len() - 1)];
+                            failures += 1;
+                            warn!("Let's Encrypt certificate for {addr} failed: {e:#}");
+                            warn!(
+                                "serving the self-signed certificate; retrying in {} min",
+                                delay.as_secs() / 60
+                            );
+                            (OffsetDateTime::now_utc() + delay, Some(format!("{e:#}")))
+                        }
+                    };
+                    self.outcome.send_replace(Some(Outcome {
+                        at: OffsetDateTime::now_utc(),
+                        error,
+                        next,
+                    }));
+                    Some(next)
+                }
             };
             let sleep = async {
                 match wake_at {

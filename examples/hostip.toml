@@ -26,9 +26,6 @@ staging = false                 # set true while testing (untrusted, no rate lim
 
 [tls]
 # dir = 'C:\ProgramData\hostip\certs'
-# Serve your own certificate instead (turns Let's Encrypt off; reloaded when the files change):
-# cert = 'C:\hostip\tls\fullchain.pem'
-# key = 'C:\hostip\tls\privkey.pem'
 
 # Optional: copy the trusted certificate for a TURN-over-TLS server.
 # [tls.export]

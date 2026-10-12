@@ -1,0 +1,21 @@
+# Test data for tests/smoke/run.sh: two public ports in front of one local app.
+[server]
+http_listen = 0
+
+[network]
+public_ip = "203.0.113.7"   # documentation address; nothing goes out
+upnp = false
+
+[acme]
+enabled = false
+
+# Open to anyone.
+[[port]]
+local = 3999
+public = 9443
+
+# Same app behind a login.
+[[port]]
+local = 3999
+public = 9444
+auth = { user = "demo", password = "secret" }
