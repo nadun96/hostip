@@ -182,6 +182,16 @@ the flow carrying on; finally a commit made directly on `main` shows the guard. 
    refused: merge main into dev, then the flow continues
 ```
 
+## Releasing
+
+Releases are cut from `main`. Set the new `version` in `Cargo.toml` through the
+usual flow (a pull request into `dev`), then either push a tag such as `v0.2.0`
+on `main`, or open **Actions → Release → Run workflow** on `main` and enter the
+version: the workflow creates the tag itself. Either way it checks that the
+version matches `Cargo.toml`, builds Windows, Linux (x86_64, arm64) and macOS
+(arm64, x86_64) packages with SHA-256 checksums, and opens a **draft** release
+to review and publish.
+
 ## One-time setup on GitHub
 
 1. **Bring `dev` up to date with `main`.** `dev` must contain everything on
