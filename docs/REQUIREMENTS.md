@@ -561,4 +561,5 @@ protocol = "udp"
 | S9 | ✅ | Windows service as LocalService by default; systemd unit with only CAP_NET_BIND_SERVICE |
 | Windows | ✅ | Service, firewall rules, CI on windows-latest, Wine-based local testing |
 | Port conflicts | ✅ | A port already in use names its owner: `/proc` on Linux, `netstat` + `tasklist` on Windows (PID 4 reported as HTTP.sys / IIS), `lsof` on macOS (`src/portowner.rs`) |
+| Observability | ✅ | `tracing` logs, `RUST_LOG` filter, `--log-format json` / `HOSTIP_LOG_FORMAT=json` (stderr; the Windows service log file too) |
 | Distribution | ✅ | Release workflow for Windows/Linux/macOS binaries |
