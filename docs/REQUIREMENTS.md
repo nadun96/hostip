@@ -560,4 +560,5 @@ protocol = "udp"
 | S7 | ✅ | Hop-by-hop headers stripped; generic 502 text |
 | S9 | ✅ | Windows service as LocalService by default; systemd unit with only CAP_NET_BIND_SERVICE |
 | Windows | ✅ | Service, firewall rules, CI on windows-latest, Wine-based local testing |
+| Port conflicts | ✅ | A port already in use names its owner: `/proc` on Linux, `netstat` + `tasklist` on Windows (PID 4 reported as HTTP.sys / IIS), `lsof` on macOS (`src/portowner.rs`) |
 | Distribution | ✅ | Release workflow for Windows/Linux/macOS binaries |
