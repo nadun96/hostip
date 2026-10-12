@@ -5,6 +5,7 @@ edition = "2024"
 description = "Publish local apps on your public IP over HTTPS, with Let's Encrypt IP certificates"
 repository = "https://github.com/nadun96/hostip"
 readme = "README.md"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.104"

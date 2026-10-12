@@ -540,6 +540,8 @@ protocol = "udp"
 | F10 | ✅ | Port-80 listener: ACME HTTP-01 + redirect to https |
 | F12, F26 | ✅ | UPnP-IGD with PCP/NAT-PMP fallback, leases renewed, removed on exit (`src/portmap.rs`; fake-router tests) |
 | F13, F29 | 🟡 | Double-NAT/CGNAT warning from the router's WAN address; Let's Encrypt validation proves 443/80 reachability. No independent outside probe yet |
+| F14 | ✅ | `expose`, `status`, `ip`, `cert`, `hash-password`, `service`, `relay`. `status` shows links, certificate expiry, the last Let's Encrypt result and next renewal, open connections; `--json`; exit code 1 when not running (`src/status.rs`) |
+| F13, F29 | ✅ | `hostip check`: a `hostip relay` probes the caller's own public IP from outside (TCP connect, UDP datagrams; temporary listeners and UPnP mappings for free ports); CGNAT / double NAT from the router's WAN address vs. the observed IP (`src/check.rs`; end-to-end tests in `tests/check.rs`). Needs a relay; no third-party probe |
 | F14 | ✅ | `expose`, `status`, `ip`, `cert`, `hash-password`, `service`, `relay` |
 | F15 | ✅ | Config file polled; valid changes restart the listeners in-process, invalid ones are rejected |
 | F16 | ✅ | Graceful shutdown with drain (Ctrl+C, SIGTERM, service stop) |

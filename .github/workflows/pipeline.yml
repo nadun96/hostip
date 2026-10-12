@@ -1,0 +1,70 @@
+name: Pipeline
+
+# feature/* --PR--> dev --(CI passes)--> test --(smoke tests pass)--> main
+#
+# A push to dev runs CI and fast-forwards test to the tested commit; the test
+# stage then runs end-to-end smoke tests and fast-forwards main. Everything runs
+# in one workflow run because pushes made with the built-in GITHUB_TOKEN do not
+# start new runs. A push to test (by a person) starts at the test stage.
+# See docs/WORKFLOW.md.
+on:
+  push:
+    branches: [dev, test]
+
+# One promotion at a time, in order.
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dev-ci:
+    if: github.ref_name == 'dev'
+    uses: ./.github/workflows/ci.yml
+
+  promote-to-test:
+    needs: dev-ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # A token that may push past branch protection, if one is configured.
+          token: ${{ secrets.PROMOTE_TOKEN || github.token }}
+      - run: scripts/promote.sh "$GITHUB_SHA" test
+
+  smoke:
+    needs: promote-to-test
+    if: ${{ !cancelled() && (github.ref_name == 'test' || needs.promote-to-test.result == 'success') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: cargo build --release
+      - name: Smoke test with tests/smoke data
+        shell: bash
+        run: tests/smoke/run.sh "target/release/hostip$([ "$RUNNER_OS" = Windows ] && echo .exe || true)"
+
+  promote-to-main:
+    needs: smoke
+    if: ${{ !cancelled() && needs.smoke.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PROMOTE_TOKEN || github.token }}
+      - run: scripts/promote.sh "$GITHUB_SHA" main

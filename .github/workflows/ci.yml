@@ -1,9 +1,12 @@
 name: CI
 
+# Checks every pull request and feature-branch push. The promotion pipeline
+# (pipeline.yml) reuses it for the dev stage.
 on:
-  push:
-    branches: [main, dev]
   pull_request:
+  push:
+    branches-ignore: [dev, test, main]
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always

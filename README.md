@@ -1,8 +1,15 @@
-# hostip
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hop-logo-dark.svg">
+    <img src="docs/assets/hop-logo.svg" alt="Hop" width="280">
+  </picture>
+</p>
 
-Publish apps running on your PC to the internet through your public IP over
-HTTPS. One Rust binary, no third-party tunnel service, and it doesn't care what
-stack your app is built with.
+# Hop
+
+**Hop** (command: `hostip`) publishes apps running on your PC to the internet
+through your public IP over HTTPS. One Rust binary, no third-party tunnel
+service, and it doesn't care what stack your app is built with.
 
 ```
 hostip expose 3000 8080 udp:50000-60000
@@ -64,11 +71,12 @@ hostip expose [PORTS]... [--config hostip.toml] [--public-ip IP] [--bind ADDR] [
               [--ip-file FILE] [--on-ip-change CMD] [--export-cert FILE --export-key FILE]
               [--on-cert-renew CMD]
 hostip hash-password   # reads a password on stdin, prints an Argon2 hash for the config
-hostip status  # is it running? public links, certificate expiry
+hostip status [--json] [--data-dir DIR]  # is it running? links, certificate expiry, last renewal, connections
 hostip ip      # show the public and LAN IP addresses
 hostip service install --config hostip.toml [--system]   # run in the background
 hostip service uninstall
 hostip relay [--listen 0.0.0.0:7000] [--token TOKEN] [--allow-ports LIST]   # on a public server
+hostip check [PORTS]... [--config hostip.toml] [--relay HOST:PORT --relay-token T --relay-fingerprint F]
 hostip cert    # show the stored certificate
 ```
 
@@ -212,6 +220,29 @@ TCP 3000 -> 192.168.1.10:13000
 UDP 50000-60000 -> 192.168.1.10:50000-60000
 ```
 
+### Checking that visitors can reach you
+
+`hostip check` (same ports or `--config` as `expose`) tests the path from the
+internet: a `hostip relay` you run on a public server connects back to your
+public IP on every TCP port and sends a datagram to every UDP port (the first 64
+of a range). Ports nothing listens on yet get a temporary listener, and a
+temporary router mapping via UPnP, so it works before or while `expose` runs; a
+UDP port the app already holds is reported as not tested. The relay only ever
+probes the address that connected to it with the right token.
+
+```
+Seen from outside (relay 203.0.113.50:7000): public IP 198.51.100.4
+Router's internet address: 100.64.12.7
+
+  TCP 443 -> port 443            reachable
+  UDP 50000 -> port 50000        NOT RECEIVED
+
+- the router's internet address 100.64.12.7 is private or CGNAT: ... use relay mode
+```
+
+It exits with 1 when a checked port is unreachable. Without a relay it reports
+the router side only (UPnP, the router's internet address, CGNAT).
+
 ### Config file
 
 ```toml
@@ -289,3 +320,15 @@ Logging is controlled with `RUST_LOG`, e.g. `RUST_LOG=hostip=debug`.
 `--log-format json` (or `HOSTIP_LOG_FORMAT=json`, which also reaches the
 systemd unit and the Windows service) writes one JSON object per line instead,
 on stderr, so the summary on stdout stays readable.
+
+## Contributing
+
+Each feature gets its own `feature/<name>` branch and a pull request into `dev`.
+From there the pipeline promotes automatically: `dev` → `test` when CI passes,
+`test` → `main` when the end-to-end smoke tests pass. See
+[docs/WORKFLOW.md](docs/WORKFLOW.md) for the flow, the test data, and a runnable
+demo (`scripts/demo-flow.sh`).
+
+## License
+
+[MIT](LICENSE). The Hop name and logo (`docs/assets/`) identify this project.
