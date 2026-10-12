@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 use hostip::access::{self, AuthConfig, Guard};
 use hostip::acme::{self, AcmeManager, AcmeOptions, ChallengeKind, HttpChallenges};
 use hostip::cert::{self, CertStore};
+use hostip::check::{self, CheckOptions, Observer};
 use hostip::config::{
     FileConfig, Mode, PortRange, PortSpec, RelaySection, parse_duration, validate_specs,
 };
@@ -51,6 +52,10 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Check from outside whether visitors can reach the published ports
+    /// (TCP and UDP), using a `hostip relay` as the observer. Exits with 1 when
+    /// a checked port is unreachable.
+    Check(Box<CheckArgs>),
     /// Hash a password for `password_hash` in the config file (reads it from stdin).
     HashPassword,
     /// Run a relay on a machine with a public IP, for homes where no port can be opened.
@@ -85,6 +90,27 @@ enum ServiceCommand {
         #[arg(short, long)]
         config: PathBuf,
     },
+}
+
+#[derive(Args)]
+struct CheckArgs {
+    /// Ports as for `expose`, e.g. `3000:443 udp:50000-50100`.
+    ports: Vec<String>,
+    /// The config file used with `expose` (its ports and [relay] are used).
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    /// Relay (host:port) that checks from outside.
+    #[arg(long, requires_all = ["relay_token", "relay_fingerprint"])]
+    relay: Option<String>,
+    /// The relay's token.
+    #[arg(long, env = "HOSTIP_RELAY_TOKEN", hide_env_values = true)]
+    relay_token: Option<String>,
+    /// The relay's certificate fingerprint (printed by `hostip relay`).
+    #[arg(long)]
+    relay_fingerprint: Option<String>,
+    /// Don't map free ports on the router for the check.
+    #[arg(long)]
+    no_upnp: bool,
 }
 
 #[derive(Args)]
@@ -230,6 +256,7 @@ async fn run(command: Command) -> Result<()> {
             }
             Ok(())
         }
+        Command::Check(args) => check_command(*args).await,
         Command::HashPassword => {
             let mut password = String::new();
             std::io::stdin().read_line(&mut password)?;
@@ -277,6 +304,38 @@ async fn run(command: Command) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn check_command(args: CheckArgs) -> Result<()> {
+    let (file, specs) = load_specs(&ExposeArgs {
+        ports: args.ports.clone(),
+        config: args.config.clone(),
+        ..ExposeArgs::default()
+    })?;
+    let observer = match (&args.relay, &file.relay) {
+        (Some(address), _) => Some(Observer::new(
+            address,
+            args.relay_token.as_deref().unwrap_or_default(),
+            args.relay_fingerprint.as_deref().unwrap_or_default(),
+        )?),
+        (None, Some(r)) => Some(Observer::new(&r.address, &r.token, &r.fingerprint)?),
+        (None, None) => None,
+    };
+    let http_listen = file.server.http_listen.unwrap_or(80);
+    let opts = CheckOptions {
+        specs,
+        http_listen: (http_listen != 0).then_some(http_listen),
+        observer,
+        upnp: !args.no_upnp && file.network.upnp.unwrap_or(true),
+        lan_ip: publicip::lan_ip(),
+    };
+    println!("Checking reachability...");
+    let report = check::run(&opts).await;
+    print!("{}", report.render());
+    if !report.all_reachable() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 async fn relay_command(args: RelayArgs, shutdown: CancellationToken) -> Result<()> {

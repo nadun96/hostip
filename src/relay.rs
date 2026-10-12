@@ -79,6 +79,45 @@ enum Msg {
     },
     Ping,
     Pong,
+    /// Asks the relay to check, from outside, which ports of the caller's own public
+    /// address answer (F13, F29). Sent instead of `Hello` on a fresh connection.
+    Probe {
+        token: String,
+        tcp: Vec<u16>,
+        udp: Vec<u16>,
+        nonce: u64,
+    },
+    ProbeResult {
+        /// The caller's address as the relay sees it (its public IP).
+        observed: IpAddr,
+        tcp: Vec<(u16, TcpReach)>,
+    },
+}
+
+/// What a TCP connection attempt from the relay found.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpReach {
+    /// Something accepted the connection.
+    Open,
+    /// Actively refused: forwarded or answered, but nothing listens there.
+    Refused,
+    /// No answer at all: dropped by the router, a firewall, the ISP or CGNAT.
+    Timeout,
+}
+
+/// Most ports one probe may ask for, so a relay cannot be used as a port scanner.
+pub const MAX_PROBE_PORTS: usize = 256;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_UDP_ROUNDS: u32 = 3;
+const PROBE_MAGIC: &[u8] = b"hostip-probe";
+
+/// Datagram the relay sends to each probed UDP port.
+pub fn probe_datagram(nonce: u64, port: u16) -> Vec<u8> {
+    let mut d = PROBE_MAGIC.to_vec();
+    d.extend_from_slice(&nonce.to_be_bytes());
+    d.extend_from_slice(&port.to_be_bytes());
+    d
 }
 
 async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Msg) -> Result<()> {
@@ -344,6 +383,44 @@ async fn relay_accept(
             }
             relay_control(state, tls, peer, tcp_ports, udp_ports, shutdown).await
         }
+        Msg::Probe {
+            token,
+            tcp,
+            udp,
+            nonce,
+        } => {
+            if !state.token.matches(&token) {
+                warn!(%peer, "relay: wrong token");
+                return write_msg(
+                    &mut tls,
+                    &Msg::Refused {
+                        reason: "wrong token".into(),
+                    },
+                )
+                .await;
+            }
+            if tcp.len() + udp.len() > MAX_PROBE_PORTS {
+                return write_msg(
+                    &mut tls,
+                    &Msg::Refused {
+                        reason: format!("at most {MAX_PROBE_PORTS} ports per check"),
+                    },
+                )
+                .await;
+            }
+            // Only ever the caller's own address: the relay is not a scanner for others.
+            let target = peer.ip().to_canonical();
+            info!(%target, tcp = tcp.len(), udp = udp.len(), "reachability check");
+            let tcp = probe(target, &tcp, &udp, nonce).await;
+            write_msg(
+                &mut tls,
+                &Msg::ProbeResult {
+                    observed: target,
+                    tcp,
+                },
+            )
+            .await
+        }
         Msg::Attach { id, token } => {
             if !state.token.matches(&token) {
                 return Ok(());
@@ -354,6 +431,91 @@ async fn relay_accept(
             Ok(())
         }
         other => bail!("unexpected first message {other:?}"),
+    }
+}
+
+/// Sends probe datagrams to the UDP ports and tries a TCP connection to each TCP port.
+async fn probe(ip: IpAddr, tcp: &[u16], udp: &[u16], nonce: u64) -> Vec<(u16, TcpReach)> {
+    let udp_task = {
+        let udp = udp.to_vec();
+        tokio::spawn(async move {
+            let bind: SocketAddr = match ip {
+                IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
+                IpAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+            };
+            let Ok(socket) = UdpSocket::bind(bind).await else {
+                return;
+            };
+            // A few rounds, since single datagrams get lost.
+            for _ in 0..PROBE_UDP_ROUNDS {
+                for &port in &udp {
+                    let _ = socket
+                        .send_to(&probe_datagram(nonce, port), (ip, port))
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+    };
+    let mut attempts = tokio::task::JoinSet::new();
+    for &port in tcp {
+        attempts.spawn(async move {
+            let reach =
+                match tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect((ip, port))).await {
+                    Ok(Ok(_)) => TcpReach::Open,
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        TcpReach::Refused
+                    }
+                    _ => TcpReach::Timeout,
+                };
+            (port, reach)
+        });
+    }
+    let mut results = attempts.join_all().await;
+    results.sort_unstable_by_key(|(port, _)| *port);
+    let _ = udp_task.await;
+    results
+}
+
+/// Asks the relay at `relay` to probe this machine's public address from outside.
+/// Returns the address it saw and the TCP results; UDP results are whichever
+/// [`probe_datagram`]s arrive at the caller's sockets.
+pub async fn request_probe(
+    relay: &str,
+    token: &str,
+    fingerprint: &str,
+    tcp: Vec<u16>,
+    udp: Vec<u16>,
+    nonce: u64,
+) -> Result<(IpAddr, Vec<(u16, TcpReach)>)> {
+    let config = client_config(fingerprint)?;
+    let addr = resolve(relay).await?;
+    let tcp_stream = tokio::time::timeout(ATTACH_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .with_context(|| format!("connecting to the relay {relay} timed out"))?
+        .with_context(|| format!("cannot connect to the relay {relay}"))?;
+    let mut tls = TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from(SERVER_NAME)?, tcp_stream)
+        .await
+        .context("TLS with the relay failed")?;
+    write_msg(
+        &mut tls,
+        &Msg::Probe {
+            token: token.to_owned(),
+            tcp,
+            udp,
+            nonce,
+        },
+    )
+    .await?;
+    let answer = tokio::time::timeout(PROBE_TIMEOUT * 4, read_msg(&mut tls))
+        .await
+        .context("the relay did not answer the check")?
+        .context("the relay closed the connection (an older relay without checks?)")?;
+    match answer {
+        Msg::ProbeResult { observed, tcp } => Ok((observed, tcp)),
+        Msg::Refused { reason } => bail!("relay refused: {reason}"),
+        other => bail!("unexpected relay message {other:?}"),
     }
 }
 
@@ -714,6 +876,23 @@ impl ServerCertVerifier for Pinned {
     }
 }
 
+/// TLS client settings that trust only the relay certificate with `fingerprint`.
+fn client_config(fingerprint: &str) -> Result<rustls::ClientConfig> {
+    let fingerprint = parse_fingerprint(fingerprint)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    Ok(
+        rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Pinned {
+                fingerprint,
+                provider,
+            }))
+            .with_no_client_auth(),
+    )
+}
+
 struct Client {
     opts: ClientOptions,
     connector: TlsConnector,
@@ -743,23 +922,13 @@ pub async fn resolve(relay: &str) -> Result<SocketAddr> {
 /// Keeps a connection to the relay open (reconnecting with backoff) and feeds the
 /// relayed visitors into `injector`.
 pub async fn run_client(opts: ClientOptions, injector: Injector, shutdown: CancellationToken) {
-    let fingerprint = match parse_fingerprint(&opts.fingerprint) {
-        Ok(f) => f,
+    let config = match client_config(&opts.fingerprint) {
+        Ok(c) => c,
         Err(e) => {
             warn!("relay: {e:#}");
             return;
         }
     };
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(Pinned {
-            fingerprint,
-            provider,
-        }))
-        .with_no_client_auth();
     let mut delay = Duration::from_secs(1);
     loop {
         let relay_addr = match resolve(&opts.relay).await {
