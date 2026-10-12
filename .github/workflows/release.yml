@@ -48,7 +48,7 @@ jobs:
         run: |
           name="hostip-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp README.md examples/hostip.toml "$name/"
+          cp README.md LICENSE examples/hostip.toml "$name/"
           if [ "${{ matrix.archive }}" = zip ]; then
             cp "target/${{ matrix.target }}/release/hostip.exe" "$name/"
             7z a "$name.zip" "$name" > /dev/null
