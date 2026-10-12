@@ -298,7 +298,10 @@ mode = "udp"
 
 Pre-built binaries for Windows, Linux (x86_64, arm64) and macOS are attached to
 each [GitHub release](https://github.com/nadun96/hostip/releases), together with
-`examples/hostip.toml` and SHA-256 checksums.
+`examples/hostip.toml` and SHA-256 checksums. On Windows, the `.msi` installs
+`hostip` to `C:\Program Files\Hop` and puts it on the PATH; then run
+`hostip service install --config ...` from an Administrator prompt for the
+background service.
 
 ## Building
 
