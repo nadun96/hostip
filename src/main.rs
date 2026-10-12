@@ -25,6 +25,7 @@ use hostip::server::{self, Server, ServerOptions};
 use hostip::service;
 
 const DEFAULT_IP_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const USER_CERT_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(version, about = "Publish local apps on your public IP over HTTPS")]
@@ -115,6 +116,12 @@ struct ExposeArgs {
     /// Where certificates are stored.
     #[arg(long)]
     cert_dir: Option<PathBuf>,
+    /// Serve this certificate chain (PEM) instead of a generated one (needs --key).
+    #[arg(long, requires = "key")]
+    cert: Option<PathBuf>,
+    /// Private key (PEM) of --cert.
+    #[arg(long, requires = "cert")]
+    key: Option<PathBuf>,
     /// Extra names or IPs to include in the self-signed certificate.
     #[arg(long = "san")]
     sans: Vec<String>,
@@ -503,27 +510,68 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
             cert::load_or_generate(&cert_dir, &sans)
         }
     };
-    let (key, info) = self_signed(public_ip)?;
-    info!(
-        "{}{info}",
-        if info.generated {
-            "generated "
-        } else {
-            "using "
+    // A user-supplied certificate (F6) replaces both the self-signed and the Let's Encrypt one.
+    let user_paths = cert::user_paths(
+        args.cert.clone().or(file.tls.cert.clone()),
+        args.key.clone().or(file.tls.key.clone()),
+    )?;
+    let mut cert_name = None;
+    let certs = if let Some((cert_path, key_path)) = &user_paths {
+        let user = cert::load_user(cert_path, key_path)?;
+        info!("using {user} ({})", cert_path.display());
+        if user.not_after <= time::OffsetDateTime::now_utc() {
+            warn!("{} has expired", cert_path.display());
         }
-    );
-    let certs = CertStore::new(key.clone());
-    if let Ok(pem) = info.read_pem() {
-        certs.replace_with_pem(key, pem);
-    }
+        match public_ip {
+            Some(ip) if cert::covers(&user.sans, &ip.to_string()) => {}
+            _ => {
+                // A certificate for a domain: links use its name, which DNS must point here.
+                cert_name = user
+                    .sans
+                    .iter()
+                    .find(|n| !n.starts_with("*.") && n.parse::<IpAddr>().is_err())
+                    .cloned();
+                if let (Some(ip), None) = (public_ip, &cert_name) {
+                    warn!("{} does not cover the public IP {ip}", cert_path.display());
+                }
+            }
+        }
+        let certs = CertStore::new(user.key.clone());
+        certs.replace_with_pem(user.key, user.pem);
+        tokio::spawn(cert::serve_user(
+            certs.clone(),
+            cert_path.clone(),
+            key_path.clone(),
+            USER_CERT_CHECK_INTERVAL,
+            shutdown.clone(),
+        ));
+        certs
+    } else {
+        let (key, info) = self_signed(public_ip)?;
+        info!(
+            "{}{info}",
+            if info.generated {
+                "generated "
+            } else {
+                "using "
+            }
+        );
+        let certs = CertStore::new(key.clone());
+        if let Ok(pem) = info.read_pem() {
+            certs.replace_with_pem(key, pem);
+        }
+        certs
+    };
 
     let bind = args
         .bind
         .or(file.server.bind)
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-    let host = public_ip
-        .or(lan_ip)
-        .map_or_else(|| "localhost".to_owned(), |ip| ip.to_string());
+    let host = cert_name.clone().unwrap_or_else(|| {
+        public_ip
+            .or(lan_ip)
+            .map_or_else(|| "localhost".to_owned(), |ip| ip.to_string())
+    });
     let options = ServerOptions {
         guard: Guard::new(file.limits.clone()),
         access_log: args.access_log || file.server.access_log,
@@ -564,7 +612,7 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
     if http_bound.is_some() {
         challenge_kinds.push(ChallengeKind::Http01);
     }
-    let acme_enabled = !args.no_acme && file.acme.enabled.unwrap_or(true);
+    let acme_enabled = user_paths.is_none() && !args.no_acme && file.acme.enabled.unwrap_or(true);
     let acme_active = acme_enabled
         && !challenge_kinds.is_empty()
         && !public_ip.is_some_and(publicip::is_non_public);
@@ -582,7 +630,13 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
         &host,
         lan_ip,
         http_bound,
-        acme_active,
+        if user_paths.is_some() {
+            CertSource::User
+        } else if acme_active {
+            CertSource::Acme
+        } else {
+            CertSource::SelfSigned
+        },
         upnp,
         relay.as_ref().map(|r| r.address.as_str()),
     );
@@ -667,7 +721,8 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
     tokio::spawn(report_ip_changes(
         ip_rx,
         specs.clone(),
-        (!acme_active).then(|| {
+        cert_name.is_none(),
+        (!acme_active && user_paths.is_none()).then(|| {
             let certs = certs.clone();
             move |ip| match self_signed(Some(ip))
                 .and_then(|(key, info)| Ok((key, info.read_pem()?)))
@@ -738,6 +793,7 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
 async fn report_ip_changes(
     mut ip: watch::Receiver<Option<IpAddr>>,
     specs: Vec<PortSpec>,
+    links_use_ip: bool,
     refresh_self_signed: Option<impl Fn(IpAddr)>,
 ) {
     while ip.changed().await.is_ok() {
@@ -746,6 +802,9 @@ async fn report_ip_changes(
         };
         if let Some(refresh) = &refresh_self_signed {
             refresh(addr);
+        }
+        if !links_use_ip {
+            continue;
         }
         let host = url_host(&addr.to_string());
         for s in specs.iter().filter(|s| s.mode != Mode::Udp) {
@@ -781,12 +840,19 @@ fn url_host(host: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CertSource {
+    SelfSigned,
+    Acme,
+    User,
+}
+
 fn print_summary(
     specs: &[PortSpec],
     host: &str,
     lan_ip: Option<IpAddr>,
     http_listen: Option<u16>,
-    acme: bool,
+    cert: CertSource,
     upnp: bool,
     relay: Option<&str>,
 ) {
@@ -855,12 +921,14 @@ fn print_summary(
         );
     }
     println!();
-    if acme {
-        println!(
+    match cert {
+        CertSource::User => println!("Serving your certificate; replaced files are picked up."),
+        CertSource::Acme => println!(
             "Serving a self-signed certificate until Let's Encrypt issues the certificate for the IP."
-        );
-    } else {
-        println!("The certificate is self-signed, so browsers will show a warning.");
+        ),
+        CertSource::SelfSigned => {
+            println!("The certificate is self-signed, so browsers will show a warning.")
+        }
     }
     println!("Press Ctrl+C to stop.");
 }
