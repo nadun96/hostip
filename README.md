@@ -61,6 +61,22 @@ Releases are built for Windows, Linux and macOS by `.github/workflows/release.ym
 when a `v*` tag is pushed. A documented example config for a polling app plus a
 video conferencing server is in [`examples/hostip.toml`](examples/hostip.toml).
 
+## Desktop app
+
+Prefer windows to terminals? **Hop** (`hop-gui`) is a small desktop app that
+ships next to `hostip` in every release and in the Windows installer (Start
+menu → Hop). Type the ports, pick how visitors log in, and press Start: it shows
+the visitor links (with a QR code for phones), the generated login, the
+certificate and the live log, and has buttons for the reachability check and
+for exporting the local CA. Stop, or closing the app, shuts `hostip` down
+cleanly so router mappings are removed.
+
+![The Hop desktop app publishing port 3000](docs/assets/hop-gui.png)
+
+The app runs the `hostip` command found next to it (or on the PATH), so
+everything below applies to it too. If `hostip` is already running, for example
+as a service, Hop shows its links and status instead of starting a second one.
+
 ## Usage
 
 Quick mode: `hostip 3000` publishes port 3000 behind a generated login (user
@@ -311,16 +327,21 @@ mode = "udp"
 Pre-built binaries for Windows, Linux (x86_64, arm64) and macOS are attached to
 each [GitHub release](https://github.com/nadun96/hostip/releases), together with
 `examples/hostip.toml` and SHA-256 checksums. On Windows, the `.msi` installs
-`hostip` to `C:\Program Files\Hop` and puts it on the PATH; then run
+`hostip` and the Hop desktop app to `C:\Program Files\Hop`, adds Hop to the
+Start menu and puts `hostip` on the PATH; then run
 `hostip service install --config ...` from an Administrator prompt for the
 background service.
 
 ## Building
 
 ```
-cargo build --release
-cargo test
+cargo build --release          # hostip
+cargo build --release -p hop-gui   # the desktop app
+cargo test --workspace
 ```
+
+On Linux the desktop app needs the usual X11/Wayland libraries at runtime
+(`libxkbcommon-x11-0` on Debian/Ubuntu).
 
 `cargo bench --bench e2e` measures the real binary against the performance
 targets in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) §4 (requests per second,

@@ -216,6 +216,10 @@ struct ExposeArgs {
     /// Set by quick mode: generate a login unless --auth or --no-auth is given.
     #[arg(long, hide = true)]
     quick: bool,
+    /// Shut down gracefully when stdin closes (used by the Hop GUI, which holds
+    /// the pipe; also stops hostip if the GUI goes away).
+    #[arg(long, hide = true)]
+    stop_on_stdin_eof: bool,
     /// Only let these networks connect (CIDR, repeatable), e.g. `--allow 203.0.113.0/24`.
     #[arg(long = "allow")]
     allow: Vec<ipnet::IpNet>,
@@ -307,12 +311,35 @@ fn init_logging(format: LogFormat, file: Option<std::fs::File>) {
             .json()
             .with_writer(std::sync::Mutex::new(file))
             .init(),
-        (LogFormat::Json, None) => builder.json().with_writer(std::io::stderr).init(),
+        (LogFormat::Json, None) => builder
+            .json()
+            .with_writer(|| LossyWriter(std::io::stderr()))
+            .init(),
         (LogFormat::Text, Some(file)) => builder
             .with_ansi(false)
             .with_writer(std::sync::Mutex::new(file))
             .init(),
-        (LogFormat::Text, None) => builder.init(),
+        (LogFormat::Text, None) => builder
+            .with_writer(|| LossyWriter(std::io::stdout()))
+            .init(),
+    }
+}
+
+/// A console writer that drops output when it cannot be written, e.g. when the
+/// program reading hostip's output (the Hop GUI) has gone away. Otherwise the
+/// logger reports the failure on stderr, and that panics when stderr is gone
+/// too, killing whichever task was logging (including shutdown work).
+struct LossyWriter<W>(W);
+
+impl<W: std::io::Write> std::io::Write for LossyWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.write_all(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = self.0.flush();
+        Ok(())
     }
 }
 
@@ -333,6 +360,9 @@ async fn run(command: Command) -> Result<()> {
             }
             let shutdown = CancellationToken::new();
             tokio::spawn(wait_for_signal(shutdown.clone()));
+            if args.stop_on_stdin_eof {
+                tokio::spawn(stop_on_stdin_eof(shutdown.clone()));
+            }
             expose_with_reload(*args, shutdown).await
         }
         Command::Status { data_dir, json } => {
@@ -970,7 +1000,11 @@ async fn expose(args: ExposeArgs, shutdown: CancellationToken) -> Result<()> {
             None => "direct".to_owned(),
         };
         let urls = move |ip: Option<IpAddr>| {
-            let host = url_host(&ip.map_or_else(|| "localhost".to_owned(), |ip| ip.to_string()));
+            // Same fallback as the startup summary: the LAN address when the public IP is unknown.
+            let host = url_host(
+                &ip.or(lan_ip)
+                    .map_or_else(|| "localhost".to_owned(), |ip| ip.to_string()),
+            );
             specs
                 .iter()
                 .filter(|s| s.mode != Mode::Udp)
@@ -1207,6 +1241,20 @@ fn print_summary(
     println!("Press Ctrl+C to stop.");
 }
 
+/// Cancels `shutdown` once stdin reaches end of file (or fails).
+async fn stop_on_stdin_eof(shutdown: CancellationToken) {
+    use tokio::io::AsyncReadExt;
+    let mut stdin = tokio::io::stdin();
+    let mut buf = [0u8; 256];
+    while let Ok(n) = stdin.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+    }
+    shutdown.cancel();
+    info!("stdin closed; shutting down");
+}
+
 async fn wait_for_signal(shutdown: CancellationToken) {
     #[cfg(unix)]
     {
@@ -1232,21 +1280,11 @@ fn default_sources() -> Vec<String> {
 
 /// Where hostip keeps its state (the certificate directory's parent).
 fn default_data_dir() -> PathBuf {
-    default_cert_dir()
-        .parent()
-        .map_or_else(|| PathBuf::from(".hostip"), PathBuf::from)
+    hostip::paths::default_data_dir()
 }
 
 fn default_cert_dir() -> PathBuf {
-    if cfg!(windows)
-        && let Some(dir) = std::env::var_os("ProgramData")
-    {
-        return PathBuf::from(dir).join("hostip").join("certs");
-    }
-    match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home).join(".hostip").join("certs"),
-        None => PathBuf::from(".hostip").join("certs"),
-    }
+    hostip::paths::default_cert_dir()
 }
 
 #[cfg(test)]

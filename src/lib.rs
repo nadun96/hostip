@@ -9,6 +9,7 @@ pub mod check;
 pub mod config;
 pub mod hooks;
 pub mod io;
+pub mod paths;
 pub mod portmap;
 pub mod portowner;
 pub mod proxy;
