@@ -26,6 +26,7 @@ use hostip::server::{self, Server, ServerOptions};
 use hostip::service;
 use hostip::status;
 
+const QUICK_USER: &str = "hostip";
 const DEFAULT_IP_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 const CONFIG_POLL: Duration = Duration::from_secs(2);
 
@@ -192,6 +193,12 @@ struct ExposeArgs {
     /// Require this login (`user:password`) on every HTTP port without its own `auth`.
     #[arg(long)]
     auth: Option<String>,
+    /// Quick mode (`hostip 3000`): don't require the generated login.
+    #[arg(long, conflicts_with = "auth")]
+    no_auth: bool,
+    /// Set by quick mode: generate a login unless --auth or --no-auth is given.
+    #[arg(long, hide = true)]
+    quick: bool,
     /// Only let these networks connect (CIDR, repeatable), e.g. `--allow 203.0.113.0/24`.
     #[arg(long = "allow")]
     allow: Vec<ipnet::IpNet>,
@@ -238,13 +245,38 @@ struct ExposeArgs {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(quick_mode_args(std::env::args_os().collect()));
     if let Command::Service(ServiceCommand::Run { config }) = cli.command {
         return run_service(config, cli.log_format);
     }
     init_logging(cli.log_format, None);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run(cli.command))
+}
+
+/// Quick mode (F14): `hostip 3000 8080` means `hostip expose 3000 8080` with a
+/// generated login. A subcommand name never parses as a port spec.
+fn quick_mode_args(mut args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let is_port = args
+        .get(1)
+        .and_then(|a| a.to_str())
+        .is_some_and(|a| !a.starts_with('-') && PortSpec::parse_cli(a).is_ok());
+    if is_port {
+        args.insert(1, "expose".into());
+        args.insert(2, "--quick".into());
+    }
+    args
+}
+
+/// A random password for quick mode: 16 URL-safe characters (96 bits).
+fn generate_password() -> Result<String> {
+    use base64::Engine;
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 12];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("no secure randomness"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// Logs to the console, or to `file` (the Windows service log). JSON goes to
@@ -269,7 +301,19 @@ fn init_logging(format: LogFormat, file: Option<std::fs::File>) {
 
 async fn run(command: Command) -> Result<()> {
     match command {
-        Command::Expose(args) => {
+        Command::Expose(mut args) => {
+            // Generated once, so config reloads keep the same login.
+            if args.quick && args.auth.is_none() && !args.no_auth {
+                let password = generate_password()?;
+                println!();
+                println!("Quick mode: visitors log in with");
+                println!("  user:     {QUICK_USER}");
+                println!("  password: {password}");
+                println!(
+                    "(shown only now; `--auth user:password` sets your own, `--no-auth` makes the links open)"
+                );
+                args.auth = Some(format!("{QUICK_USER}:{password}"));
+            }
             let shutdown = CancellationToken::new();
             tokio::spawn(wait_for_signal(shutdown.clone()));
             expose_with_reload(*args, shutdown).await
@@ -1123,5 +1167,63 @@ fn default_cert_dir() -> PathBuf {
     match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home).join(".hostip").join("certs"),
         None => PathBuf::from(".hostip").join("certs"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<std::ffi::OsString> {
+        list.iter().map(Into::into).collect()
+    }
+
+    #[test]
+    fn quick_mode_rewrites_bare_ports() {
+        assert_eq!(
+            quick_mode_args(args(&["hostip", "3000", "udp:3478"])),
+            args(&["hostip", "expose", "--quick", "3000", "udp:3478"])
+        );
+        assert_eq!(
+            quick_mode_args(args(&["hostip", "3000:443", "--no-auth"])),
+            args(&["hostip", "expose", "--quick", "3000:443", "--no-auth"])
+        );
+        for unchanged in [
+            &["hostip", "expose", "3000"][..],
+            &["hostip", "status"],
+            &["hostip", "--help"],
+            &["hostip"],
+        ] {
+            assert_eq!(quick_mode_args(args(unchanged)), args(unchanged));
+        }
+    }
+
+    #[test]
+    fn quick_mode_parses_and_sets_a_login() {
+        let cli = Cli::try_parse_from(quick_mode_args(args(&["hostip", "3000"]))).unwrap();
+        let Command::Expose(expose) = cli.command else {
+            panic!("expected expose");
+        };
+        assert!(expose.quick && !expose.no_auth && expose.auth.is_none());
+        assert!(
+            Cli::try_parse_from(args(&[
+                "hostip",
+                "expose",
+                "3000",
+                "--no-auth",
+                "--auth",
+                "a:b"
+            ]))
+            .is_err(),
+            "--no-auth and --auth conflict"
+        );
+    }
+
+    #[test]
+    fn generated_passwords_are_long_and_differ() {
+        let (a, b) = (generate_password().unwrap(), generate_password().unwrap());
+        assert_eq!(a.len(), 16);
+        assert_ne!(a, b);
+        assert!(AuthConfig::parse_cli(&format!("{QUICK_USER}:{a}")).is_ok());
     }
 }
