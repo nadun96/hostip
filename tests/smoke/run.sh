@@ -50,8 +50,17 @@ code="$(curl_ -o "$work/part" -w '%{http_code}' -H 'Range: bytes=0-4' "https://1
 [ "$code" = 206 ] && [ "$(cat "$work/part")" = "Hello" ] || fail "range request gave $code '$(cat "$work/part")'"
 pass "Range requests pass through (206 Partial Content)"
 
-alpn="$(curl_ --http2 -o /dev/null -w '%{http_version}' "https://127.0.0.1:9443/hello.txt")"
-[ "$alpn" = 2 ] || fail "HTTP version was $alpn"
+# Asked through Python: some curl builds (e.g. Windows' own) lack HTTP/2.
+alpn="$("$python" -c '
+import socket, ssl
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ctx.set_alpn_protocols(["h2", "http/1.1"])
+with ctx.wrap_socket(socket.create_connection(("127.0.0.1", 9443)), server_hostname="127.0.0.1") as s:
+    print(s.selected_alpn_protocol())
+')" || fail "TLS connection for the ALPN check failed"
+[ "$alpn" = h2 ] || fail "ALPN selected '$alpn' instead of h2"
 pass "HTTP/2 is negotiated"
 
 code="$(curl_ -o /dev/null -w '%{http_code}' "https://127.0.0.1:9444/hello.txt")"

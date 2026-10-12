@@ -10,6 +10,7 @@ pub mod config;
 pub mod hooks;
 pub mod io;
 pub mod portmap;
+pub mod portowner;
 pub mod proxy;
 pub mod publicip;
 pub mod relay;
