@@ -17,7 +17,7 @@ flowchart LR
 |--------|------------------|-----------------|-------------|
 | `feature/<name>` | you, one feature per branch | CI on every push and on the pull request (`ci.yml`) | `dev`, by merging the pull request |
 | `dev` | pull requests only | CI again, on the merged result (`pipeline.yml`, job `dev-ci`) | `test`, automatically |
-| `test` | the pipeline only | end-to-end smoke tests with test data (`pipeline.yml`, job `smoke`) | `main`, automatically |
+| `test` | the pipeline only | end-to-end smoke tests with test data (`smoke.yml`, called by `pipeline.yml`) | `main`, automatically |
 | `main` | the pipeline only | — (release tags `v*` are cut from here, `release.yml`) | — |
 
 Promotions (`scripts/promote.sh`) leave `test` and `main` holding **exactly the
@@ -68,6 +68,9 @@ names the public IP. Run it locally with
 ```bash
 cargo build --release && tests/smoke/run.sh
 ```
+
+Pull requests that change the smoke tests or the pipeline run them too, on all
+three systems, so a broken test stage is caught before it reaches `test`.
 
 ## Demo with test data
 

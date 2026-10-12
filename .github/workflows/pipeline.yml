@@ -41,22 +41,7 @@ jobs:
   smoke:
     needs: promote-to-test
     if: ${{ !cancelled() && (github.ref_name == 'test' || needs.promote-to-test.result == 'success') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-      - run: cargo build --release
-      - name: Smoke test with tests/smoke data
-        shell: bash
-        run: tests/smoke/run.sh "target/release/hostip$([ "$RUNNER_OS" = Windows ] && echo .exe || true)"
+    uses: ./.github/workflows/smoke.yml
 
   promote-to-main:
     needs: smoke
