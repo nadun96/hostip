@@ -554,7 +554,7 @@ protocol = "udp"
 | F35, F36 | ✅ | Connectivity ladder: already reachable → UPnP → PCP/NAT-PMP → relay mode (`src/relay.rs`; end-to-end tests incl. UDP). IPv6-only path not specially handled |
 | S1 | ✅ | Upstreams are always 127.0.0.1 |
 | S2 | ✅ | rustls safe defaults (TLS 1.2/1.3) |
-| S3 | 🟡 | Basic auth + session cookie, Argon2; **opt-in** (`--auth`), not on by default — public conferencing links must work without a password prompt; the startup summary warns about open ports |
+| S3 | ✅ | Basic auth + session cookie, Argon2. On by default in quick mode (`hostip 3000`: generated password printed once, `--no-auth` to opt out); opt-in for `expose`, so public conferencing links work without a password prompt; the startup summary warns about open ports |
 | S4, S5, S8 | ✅ | `src/access.rs`: allow/deny, per-IP connection/rate limits, brute-force blocking, access log |
 | S6 | ✅ | Private keys 0600 on Unix; Windows data folder ACL set by the service installer |
 | S7 | ✅ | Hop-by-hop headers stripped; generic 502 text |
