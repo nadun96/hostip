@@ -280,3 +280,11 @@ CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine64 cargo test --target x86_64-pc-w
 ```
 
 Logging is controlled with `RUST_LOG`, e.g. `RUST_LOG=hostip=debug`.
+
+## Contributing
+
+Each feature gets its own `feature/<name>` branch and a pull request into `dev`.
+From there the pipeline promotes automatically: `dev` → `test` when CI passes,
+`test` → `main` when the end-to-end smoke tests pass. See
+[docs/WORKFLOW.md](docs/WORKFLOW.md) for the flow, the test data, and a runnable
+demo (`scripts/demo-flow.sh`).
