@@ -271,6 +271,10 @@ pub struct ServerSection {
 #[serde(deny_unknown_fields)]
 pub struct TlsSection {
     pub dir: Option<PathBuf>,
+    /// Serve this certificate chain (PEM) instead of generating one; needs `key`.
+    pub cert: Option<PathBuf>,
+    /// Private key (PEM) of `cert`.
+    pub key: Option<PathBuf>,
     #[serde(default)]
     pub extra_sans: Vec<String>,
     /// Copy the served certificate to these files for other programs (e.g. a TURN server).

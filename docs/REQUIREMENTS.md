@@ -534,7 +534,7 @@ protocol = "udp"
 | F3, F30, F31, F34 | ✅ | Stack-agnostic port specs and modes (`src/config.rs`), HTTP sniffing in `auto` |
 | F4 | ✅ | Self-signed fallback with public/LAN IP SANs (`src/cert.rs`) |
 | F5 | ⬜ | Local CA mode — superseded in practice by Let's Encrypt IP certificates |
-| F6 | ⬜ | User-supplied certificate files |
+| F6 | ✅ | `--cert`/`--key` or `[tls] cert`/`key`; key checked against the chain, files reloaded when they change (`src/cert.rs`) |
 | F7, F19 | ✅ | IP watcher with confirmation and address-family stickiness; re-issue on change (`src/publicip.rs`, `src/acme.rs`) |
 | F9 | ✅ | HTTP/2 via ALPN |
 | F10 | ✅ | Port-80 listener: ACME HTTP-01 + redirect to https |
