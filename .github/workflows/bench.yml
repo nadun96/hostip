@@ -1,0 +1,28 @@
+name: Benchmarks
+
+# End-to-end performance against the targets in docs/REQUIREMENTS.md §4
+# (benches/e2e.rs). Results go to the run's summary page; a missed target fails
+# the run. Kept out of the promotion pipeline: shared runners are noisy.
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    paths:
+      - "src/**"
+      - "benches/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --bench e2e
